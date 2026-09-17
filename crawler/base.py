@@ -6,12 +6,19 @@ a FetchResult with parsed items.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
+
+#: transport errors that are usually momentary and worth retrying
+TRANSIENT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadError,
+                    httpx.ReadTimeout, httpx.RemoteProtocolError)
+#: seconds between retry attempts (two retries per request)
+RETRY_BACKOFF = (1.0, 2.5)
 
 
 @dataclass
@@ -54,7 +61,7 @@ class FetchContext:
     client: httpx.AsyncClient
     known_guids: set[str]
     config: dict                      # plugin defaults merged with source config
-    logger: logging.Logger = field(default_factory=logging.getLogger)
+    logger: logging.Logger | logging.LoggerAdapter = field(default_factory=logging.getLogger)
     etag: str = ""                    # captured from responses, persisted by the fetcher
     last_modified: str = ""
     requests: int = 0
@@ -64,7 +71,9 @@ class FetchContext:
         """GET a URL and return its text, or None on HTTP 304.
 
         With conditional=True the stored ETag/Last-Modified of the source is
-        sent so unchanged feeds cost nothing.
+        sent so unchanged feeds cost nothing. Transient transport errors
+        (connection resets, early server disconnects) are retried with a
+        short backoff before surfacing as a source failure.
         """
         hdrs = dict(headers or {})
         if conditional:
@@ -72,8 +81,17 @@ class FetchContext:
                 hdrs.setdefault("If-None-Match", self.source["etag"])
             if self.source.get("last_modified"):
                 hdrs.setdefault("If-Modified-Since", self.source["last_modified"])
-        resp = await self.client.get(url, headers=hdrs)
-        self.requests += 1
+        for attempt in range(len(RETRY_BACKOFF) + 1):
+            try:
+                self.requests += 1
+                resp = await self.client.get(url, headers=hdrs)
+                break
+            except TRANSIENT_ERRORS as exc:
+                if attempt >= len(RETRY_BACKOFF):
+                    raise
+                self.logger.warning("transient error fetching %s (%s), retrying",
+                                    url, type(exc).__name__)
+                await asyncio.sleep(RETRY_BACKOFF[attempt])
         if resp.status_code == 304:
             return None
         resp.raise_for_status()

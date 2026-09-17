@@ -25,6 +25,20 @@ USER_AGENT = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 
 
+def _error_text(exc: BaseException) -> str:
+    """Readable error line; walks the cause chain when str(exc) is empty."""
+    detail = str(exc).strip()
+    if not detail:
+        seen, cur = {id(exc)}, exc.__cause__ or exc.__context__
+        while cur is not None and id(cur) not in seen:
+            seen.add(id(cur))
+            if str(cur).strip():
+                detail = f"{type(cur).__name__}: {str(cur).strip()}"
+                break
+            cur = cur.__cause__ or cur.__context__
+    return f"{type(exc).__name__}: {detail or repr(exc)}"[:500]
+
+
 class RefreshBusy(RuntimeError):
     pass
 
@@ -165,7 +179,7 @@ class Fetcher:
                 result["requests"] = ctx.requests
             except Exception as exc:  # Catch all to isolate failures
                 result["status"] = "error"
-                result["error"] = f"{type(exc).__name__}: {exc}"[:500]
+                result["error"] = _error_text(exc)
                 log.exception("refresh failed for %s", src["url"])
                 await self.db.update_source(
                     src["id"], last_refreshed_at=time.time(),

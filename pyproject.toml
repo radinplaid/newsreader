@@ -27,4 +27,4 @@ dev = ["pytest>=8.0", "pytest-asyncio>=0.23.0"]
 newsreader = "api.__main__:main"
 
 [tool.hatch.build.targets.wheel]
-only-include = ["api", "crawler", "models", "fetcher.py"]
+only-include = ["api", "crawler", "models", "config.py", "fetcher.py", "web"]

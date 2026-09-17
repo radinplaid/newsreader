@@ -1,7 +1,9 @@
 """Offline parser tests: fixture HTML/XML snippets, no network."""
 import pytest
+import httpx
 
 from crawler import find_plugin
+from crawler.base import FetchContext
 from crawler.plugins.arxiv import parse_abs_page, parse_search_page
 from crawler.plugins.rss import _parse_feed
 from crawler.plugins.web import extract_article, extract_listing
@@ -274,3 +276,56 @@ def test_registry_routing():
     assert find_plugin("https://arxiv.org/abs/2609.14795").name == "arxiv"
     assert find_plugin("https://www.aisi.gov.uk/blog").name == "web"
     assert find_plugin("https://some-blog.example/posts").name == "web"
+
+
+def _mock_ctx(handler):
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    return FetchContext(source={}, client=client, known_guids=set(), config={})
+
+
+@pytest.mark.asyncio
+async def test_get_text_retries_transient_errors(monkeypatch):
+    monkeypatch.setattr("crawler.base.RETRY_BACKOFF", (0.0, 0.0))
+    calls = []
+
+    def handler(request):
+        calls.append(str(request.url))
+        if len(calls) == 1:
+            raise httpx.RemoteProtocolError("Server disconnected without sending a response.")
+        return httpx.Response(200, text="hello")
+
+    ctx = _mock_ctx(handler)
+    assert await ctx.get_text("https://example.com/x") == "hello"
+    assert len(calls) == 2 and ctx.requests == 2
+    await ctx.client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_get_text_gives_up_after_two_retries(monkeypatch):
+    monkeypatch.setattr("crawler.base.RETRY_BACKOFF", (0.0, 0.0))
+    calls = []
+
+    def handler(request):
+        calls.append(str(request.url))
+        raise httpx.ConnectError("")
+
+    ctx = _mock_ctx(handler)
+    with pytest.raises(httpx.ConnectError):
+        await ctx.get_text("https://example.com/x")
+    assert len(calls) == 3  # initial attempt + 2 retries
+    await ctx.client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_get_text_does_not_retry_http_errors():
+    calls = []
+
+    def handler(request):
+        calls.append(str(request.url))
+        return httpx.Response(500)
+
+    ctx = _mock_ctx(handler)
+    with pytest.raises(httpx.HTTPStatusError):
+        await ctx.get_text("https://example.com/x")
+    assert len(calls) == 1  # the server answered: retrying would not help
+    await ctx.client.aclose()

@@ -80,6 +80,22 @@ function toast(msg, isError = false) {
   toastTimer = setTimeout(() => t.classList.remove("show"), 3200);
 }
 
+/* clipboard write with an execCommand fallback for non-secure contexts */
+async function copyText(text) {
+  if (navigator.clipboard && window.isSecureContext) {
+    try { await navigator.clipboard.writeText(text); return true; }
+    catch (_e) { /* fall through to the legacy path */ }
+  }
+  const ta = el("textarea", { style: "position:fixed;left:-9999px;top:0" });
+  ta.value = text;
+  document.body.append(ta);
+  ta.select();
+  let ok = false;
+  try { ok = document.execCommand("copy"); } catch (_e) { /* unsupported */ }
+  ta.remove();
+  return ok;
+}
+
 /* ---------------- data ---------------- */
 async function loadItems(reset = true) {
   if (state.loading || (!reset && state.done)) return;
@@ -358,6 +374,17 @@ function cardActions(item) {
       } catch (err) { toast(err.message, true); }
     },
   });
+  const copyBtn = el("button", {
+    class: "card-act copy", title: "Copy link", textContent: "⧉",
+    onclick: async (ev) => {
+      ev.stopPropagation();
+      if (!item.url) return toast("No link for this item", true);
+      if (await copyText(item.url)) {
+        copyBtn.textContent = "✓";
+        setTimeout(() => { copyBtn.textContent = "⧉"; }, 1200);
+      } else toast("Copy failed", true);
+    },
+  });
   const dismissBtn = el("button", {
     class: "card-act dismiss", title: "Dismiss — never show again", textContent: "✕",
     onclick: async (ev) => {
@@ -370,7 +397,7 @@ function cardActions(item) {
       } catch (err) { toast(err.message, true); }
     },
   });
-  return el("div", { class: "card-actions" }, openBtn, starBtn, dismissBtn);
+  return el("div", { class: "card-actions" }, openBtn, copyBtn, starBtn, dismissBtn);
 }
 
 function removeCard(item) {
@@ -407,10 +434,10 @@ function renderItems(items) {
         item.summary ? el("p", { class: "summary" }, item.summary) : null,
         el("div", { class: "card-tags" },
           (item.tags || []).slice(0, 4).map((t) =>
-            el("span", { class: "chip",             onclick: (ev) => {
-              ev.stopPropagation(); state.tag = t; refresh();
-              $(".main").scrollTo({ top: 0 });
-            } }, t)),
+          el("span", { class: "chip", onclick: (ev) => {
+            ev.stopPropagation(); state.tag = t; refresh();
+            $(".main").scrollTo({ top: 0 });
+          } }, t)),
           (item.tags || []).length > 4 ? el("span", { class: "chip" }, `+${item.tags.length - 4}`) : null)));
     list.append(card);
   }
@@ -418,6 +445,15 @@ function renderItems(items) {
 
 function noimg() {
   return el("div", { class: "noimg" }, "📰");
+}
+
+/* detail article body: sanitized HTML when DOMPurify is available,
+   otherwise plain text so a missing sanitizer can never inject markup */
+function contentNode(html) {
+  if (window.DOMPurify) {
+    return el("div", { class: "content", innerHTML: DOMPurify.sanitize(html) });
+  }
+  return el("div", { class: "content" }, html);
 }
 
 /* ---------------- detail drawer ---------------- */
@@ -453,6 +489,17 @@ async function openDetail(id) {
             ev.target.classList.toggle("star-on", item.starred);
             refreshSidebar();
           } catch (err) { toast(err.message, true); }
+        },
+      }),
+      el("button", {
+        class: "btn", textContent: "⧉ Copy link",
+        onclick: async (ev) => {
+          const btn = ev.target;
+          if (!item.url) return toast("No link for this item", true);
+          if (await copyText(item.url)) {
+            btn.textContent = "✓ Copied";
+            setTimeout(() => { btn.textContent = "⧉ Copy link"; }, 1200);
+          } else toast("Copy failed", true);
         },
       }),
       el("button", {
@@ -494,7 +541,7 @@ async function openDetail(id) {
         } })),
     item.summary && !summaryDup
       ? el("p", { style: "color:var(--text-dim)" }, item.summary) : null,
-    item.content ? el("div", { class: "content", innerHTML: DOMPurify.sanitize(item.content) }) : null,
+    item.content ? contentNode(item.content) : null,
     el("p", { style: "margin-top:22px" },
       el("a", { href: item.url, target: "_blank", rel: "noopener" }, "Open original ↗")),
   ].filter((k) => k instanceof Node);

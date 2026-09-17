@@ -74,10 +74,11 @@ async def test_upsert_counts_and_merge(db):
     # longer content should win on update
     items2 = [_item("g1", title="First", content="longer content than before")]
     await db.upsert_items(sid, items2)
-    row = db.get_source  # noqa: F841
     lst, total = await db.list_items(source_id=sid)
     assert total == 2
-    g1 = next(i for i in lst if i["guid"] == "g1")
+    # list responses stay slim: full content only comes from the detail query
+    assert all("content" not in i and "extra" not in i for i in lst)
+    g1 = await db.get_item(next(i["id"] for i in lst if i["guid"] == "g1"))
     assert g1["content"] == "longer content than before"
     assert g1["published_at"] == pytest.approx(now - 10)
     assert sorted(g1["tags"]) == ["tag1"]

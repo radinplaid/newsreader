@@ -362,7 +362,7 @@ async def refresh(body: RefreshIn, db: Database = Depends(get_db), fetcher: Fetc
         await _source_row(db, body.source_id)
     try:
         fetcher.start([body.source_id] if body.source_id else None,
-                                force=body.force)
+                      force=body.force)
     except RefreshBusy as exc:
         return JSONResponse({"error": str(exc), "status": fetcher.snapshot()},
                             status_code=409)

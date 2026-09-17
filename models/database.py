@@ -122,6 +122,23 @@ def fts_query(q: str) -> str | None:
     return " AND ".join(parts)
 
 
+_ITEM_FROM = """
+    FROM items i
+    JOIN sources s ON s.id = i.source_id
+    LEFT JOIN categories c ON c.id = s.category_id
+"""
+_ITEM_TAGS = ("(SELECT json_group_array(t.name) FROM"
+              " (SELECT t2.name FROM item_tags jt JOIN tags t2 ON t2.id = jt.tag_id"
+              "  WHERE jt.item_id = i.id ORDER BY t2.name) t) AS tags")
+_ITEM_COLS = f"""
+    i.id, i.guid, i.title, i.summary, i.url, i.image_url, i.author,
+    i.published_at, i.fetched_at, i.starred,
+    i.source_id, s.name AS source_name, s.url AS source_url,
+    c.id AS category_id, c.name AS category_name,
+    {_ITEM_TAGS}
+"""
+
+
 class Database:
     """Repository over aiosqlite."""
 
@@ -387,18 +404,9 @@ class Database:
                 )
         return (inserted, updated)
 
-    _SELECT = """
-        SELECT i.id, i.guid, i.title, i.summary, i.url, i.image_url, i.author,
-               i.published_at, i.fetched_at, i.extra, i.content, i.starred,
-               i.source_id, s.name AS source_name, s.url AS source_url,
-               c.id AS category_id, c.name AS category_name,
-               (SELECT json_group_array(t.name) FROM
-                  (SELECT t2.name FROM item_tags jt JOIN tags t2 ON t2.id = jt.tag_id
-                    WHERE jt.item_id = i.id ORDER BY t2.name) t) AS tags
-        FROM items i
-        JOIN sources s ON s.id = i.source_id
-        LEFT JOIN categories c ON c.id = s.category_id
-    """
+    # full row (detail view); the list query omits extra/content to stay slim
+    _SELECT = f"SELECT {_ITEM_COLS}, i.extra, i.content {_ITEM_FROM}"
+    _SELECT_LIST = f"SELECT {_ITEM_COLS} {_ITEM_FROM}"
 
     async def list_items(self, q: str | None = None, source_id: int | None = None,
                    category_id: int | None = None, tag: str | None = None,
@@ -440,9 +448,10 @@ class Database:
             order = "ORDER BY (i.published_at IS NULL) ASC, i.published_at DESC, i.id DESC"
         limit = max(1, min(int(limit), 200))
         offset = max(0, int(offset))
+        select = self._SELECT if include_content else self._SELECT_LIST
         conn = await self.get_conn()
         async with conn.execute(
-            f"{self._SELECT} {join} {clause} {order} LIMIT ? OFFSET ?",
+            f"{select} {join} {clause} {order} LIMIT ? OFFSET ?",
             [*args, limit, offset],
         ) as cur:
             rows = await cur.fetchall()
@@ -458,10 +467,9 @@ class Database:
         for r in rows:
             d = dict(r)
             d["tags"] = json.loads(d["tags"] or "[]")
-            d["extra"] = json.loads(d["extra"] or "{}")
             d["starred"] = bool(d["starred"])
-            if not include_content:
-                d.pop("extra", None)
+            if include_content:
+                d["extra"] = json.loads(d["extra"] or "{}")
             items.append(d)
         return items, total
 

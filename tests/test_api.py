@@ -1,12 +1,13 @@
 """API tests with an in-memory-ish temp DB and mocked refresh (no network)."""
 import time
 
+import httpx
 import pytest
 import pytest_asyncio
 from fastapi.testclient import TestClient
 
 import api.app as app_module
-from fetcher import Fetcher
+from fetcher import Fetcher, _error_text
 from models.database import Database
 
 
@@ -289,6 +290,21 @@ async def test_fetcher_run_blocking_and_busy(tmp_path, monkeypatch):
     monkeypatch.setattr(Fetcher, "_refresh_one", fake_refresh_one)
     fetcher = Fetcher(db)
     import asyncio
-    status = await fetcher.run_blocking()
-    assert status["inserted"] == 3 and status["errors"] == 0
-    assert status["results"][0]["source_id"] == sid
+    try:
+        status = await fetcher.run_blocking()
+        assert status["inserted"] == 3 and status["errors"] == 0
+        assert status["results"][0]["source_id"] == sid
+    finally:
+        await db.close()
+
+
+def test_error_text_walks_cause_chain():
+    root = OSError(104, "Connection reset by peer")
+    exc = httpx.ConnectError("")
+    exc.__cause__ = root
+    text = _error_text(exc)
+    assert text.startswith("ConnectError:") and "Connection reset by peer" in text
+    # plain exceptions keep their own message
+    assert _error_text(ValueError("boom")) == "ValueError: boom"
+    # nothing anywhere in the chain: still non-empty
+    assert _error_text(httpx.ConnectError("")).startswith("ConnectError:")
