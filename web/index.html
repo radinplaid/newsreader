@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<title>Newsreader</title>
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📰</text></svg>">
+</head>
+<body>
+
+<div id="refreshBar" class="refresh-bar hidden"><div id="refreshBarFill"></div></div>
+
+<header class="topbar">
+  <button id="menuBtn" class="icon-btn" aria-label="Toggle sidebar">☰</button>
+  <a class="brand" href="#/">📰 <span>Newsreader</span></a>
+  <div class="searchwrap">
+    <input id="search" type="search" placeholder="Search articles…  (title, summary, full text)"
+           autocomplete="off" spellcheck="false">
+    <kbd id="searchShortcut">/</kbd>
+  </div>
+  <button id="themeBtn" class="icon-btn" aria-label="Toggle theme">☾</button>
+  <button id="addBtn" class="btn primary" title="Add a news source">+ Source</button>
+</header>
+
+<div class="layout">
+  <aside id="sidebar" class="sidebar">
+    <div class="side-scroll">
+      <section>
+        <div class="side-head"><h2>Categories</h2>
+          <button class="mini-btn" id="addCatBtn" title="Add category">+</button>
+        </div>
+        <ul id="catList" class="side-list"></ul>
+      </section>
+      <section>
+        <div class="side-head"><h2>Sources</h2></div>
+        <ul id="srcList" class="side-list"></ul>
+      </section>
+      <section>
+        <div class="side-head"><h2>Tags</h2></div>
+        <div id="tagFilterWrap" class="tag-filter hidden">
+          <input id="tagFilter" type="search" placeholder="Find a tag…" autocomplete="off">
+        </div>
+        <div id="tagCloud" class="tag-cloud"></div>
+      </section>
+    </div>
+    <footer class="side-foot">
+      <span id="dbStats"></span>
+      <span id="refreshStatus" class="refresh-status hidden"></span>
+      <button id="refreshBtn" class="btn"><span id="refreshIcon">⟳</span> Refresh all</button>
+      <button id="exportBtn" class="btn" title="Download all sources (no articles) as JSON">⇩ Export</button>
+      <button id="importBtn" class="btn" title="Import sources from an exported JSON file">⇧ Import</button>
+      <input id="importFile" type="file" accept="application/json,.json" class="hidden">
+    </footer>
+  </aside>
+  <div id="scrim" class="scrim"></div>
+
+  <main class="main">
+    <div class="toolbar">
+      <div id="filterChips" class="chips"></div>
+      <select id="sortSel" class="select" title="Sort order">
+        <option value="new">Newest first</option>
+        <option value="old">Oldest first</option>
+        <option value="rank">Relevance</option>
+      </select>
+    </div>
+    <div id="itemList" class="items"></div>
+    <div id="sentinel" class="sentinel"></div>
+    <div id="endNote" class="endnote hidden">No more items.</div>
+  </main>
+</div>
+
+<!-- item detail drawer -->
+<div id="detail" class="detail" aria-hidden="true">
+  <div class="detail-inner" id="detailInner"></div>
+  <button id="detailClose" class="icon-btn detail-close" aria-label="Close">✕</button>
+</div>
+
+<!-- add source modal -->
+<dialog id="addDialog" class="modal">
+  <form id="addForm" method="dialog">
+    <h3>Add news source</h3>
+    <label>URL
+      <input name="url" type="url" required placeholder="https://example.com/blog"
+             autocomplete="off">
+    </label>
+    <p class="hint" id="pluginHint">Supported: RSS/Atom feeds, YouTube playlists &amp; channels,
+       arXiv searches, and generic blog/news listing pages.</p>
+    <label>Name <span class="opt">(optional)</span>
+      <input name="name" type="text" placeholder="My blog">
+    </label>
+    <label>Category
+      <select name="category_id" id="addCatSel"></select>
+    </label>
+    <label>Or new category <span class="opt">(optional)</span>
+      <input name="category_name" type="text" placeholder="Machine Learning">
+    </label>
+    <div class="modal-actions">
+      <button type="button" class="btn" id="addCancel">Cancel</button>
+      <button type="submit" class="btn primary">Add source</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- edit source modal -->
+<dialog id="editDialog" class="modal">
+  <form id="editForm" novalidate>
+    <h3>Edit source</h3>
+    <label>Name
+      <input name="name" type="text" placeholder="My blog" autocomplete="off">
+    </label>
+    <label>URL
+      <input name="url" type="url" required autocomplete="off">
+    </label>
+    <p class="hint" id="editHint"></p>
+    <label>Category
+      <select name="category_id" id="editCatSel"></select>
+    </label>
+    <label>Or move to new category <span class="opt">(optional)</span>
+      <input name="category_name" type="text" placeholder="New category" autocomplete="off">
+    </label>
+    <label class="check">
+      <input name="enabled" type="checkbox"> Enabled (included in “Refresh all”)
+    </label>
+    <label>Advanced options <span class="opt">(JSON, plugin-specific)</span>
+      <textarea name="config" rows="4" spellcheck="false"
+        placeholder='{"max_items": 100}'></textarea>
+    </label>
+    <div class="modal-actions space-between">
+      <button type="button" class="btn danger" id="editDelete">Delete source…</button>
+      <span class="modal-actions">
+        <button type="button" class="btn" id="editCancel">Cancel</button>
+        <button type="submit" class="btn primary">Save</button>
+      </span>
+    </div>
+  </form>
+</dialog>
+
+<div id="toast" class="toast" role="status"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.0.6/purify.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
