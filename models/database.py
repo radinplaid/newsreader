@@ -101,6 +101,11 @@ END;
 
 _fts_token = re.compile(r'"[^"]*"|\w+')
 
+# A parsed date more than this far in the future is untrustworthy (feeds from
+# CMSes with broken timezones, scheduled posts): treat it as missing so the
+# first-seen fallback applies and date enrichment can look for a real date.
+_FUTURE_DATE_TOLERANCE = 300  # seconds of allowed clock skew
+
 
 def fts_query(q: str) -> str | None:
     """Build a forgiving FTS5 MATCH expression from user input.
@@ -172,7 +177,7 @@ class Database:
 
     @staticmethod
     def _migrate(conn: sqlite3.Connection) -> None:
-        """Add columns introduced after the initial schema."""
+        """Add columns introduced after the initial schema, heal bad data."""
         cols = {r[1] for r in conn.execute("PRAGMA table_info(items)")}
         if "starred" not in cols:
             conn.execute("ALTER TABLE items ADD COLUMN starred INTEGER NOT NULL DEFAULT 0")
@@ -183,6 +188,11 @@ class Database:
             # existing rows: last fetch is the best available "added" date
             conn.execute("UPDATE items SET first_seen_at = fetched_at "
                          "WHERE first_seen_at IS NULL")
+        # items stored with a future date (feeds with broken CMS timezones):
+        # never trustworthy, so drop them; first_seen takes over as fallback
+        conn.execute("UPDATE items SET published_at = NULL "
+                     "WHERE published_at > strftime('%s','now') + ?",
+                     (_FUTURE_DATE_TOLERANCE,))
         scols = {r[1] for r in conn.execute("PRAGMA table_info(sources)")}
         if "hidden" not in scols:
             conn.execute("ALTER TABLE sources ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0")
@@ -360,6 +370,7 @@ class Database:
             return (0, 0)
         existing = await self.known_dates(source_id)
         now = time.time()
+        max_date = now + _FUTURE_DATE_TOLERANCE
         rows = []
         upd_rows = []
         seen = set()
@@ -368,10 +379,13 @@ class Database:
             if not guid or guid in seen:
                 continue
             seen.add(guid)
+            published_at = it.get("published_at")
+            if published_at is not None and published_at > max_date:
+                published_at = None  # future date: CMS timezone bug or scheduled post
             rows.append((
                 source_id, guid, it.get("url") or "", it.get("title") or "",
                 it.get("summary") or "", it.get("content") or "", it.get("author") or "",
-                it.get("published_at"), it.get("image_url") or "",
+                published_at, it.get("image_url") or "",
                 json.dumps(it.get("extra") or {}, ensure_ascii=False), now, now,
             ))
             if guid in existing:

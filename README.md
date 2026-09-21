@@ -23,9 +23,11 @@ serverless HTML5 web client (plain static files — no build step, no framework)
 * **Reliable dates** — dates are parsed from feeds, listing cards (`<time>`,
   meta tags, text patterns) and article pages. Items still missing a date are
   backfilled by scraping the article page / video info, bounded per refresh
-  and prioritized until the backlog is resolved. Anything that still has no
-  date falls back to the date the item was first seen, and undated items sort
-  after dated ones in both sort orders.
+  and prioritized until the backlog is resolved. Dates in the future are
+  treated as missing (feeds whose CMS mislabels local time as UTC), so they
+  never make an article look "just now" when it isn't. Anything that still has
+  no date falls back to the date the item was first seen, and undated items
+  sort after dated ones in both sort orders.
 * **Many items, fast** — SQLite (WAL) with indexes handles 10,000s of items
   comfortably; the listing endpoint is paginated and index-driven.
 * **Full text search** — FTS5 index over title, summary and article content,

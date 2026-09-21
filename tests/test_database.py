@@ -1,4 +1,5 @@
 """Unit tests for the SQLite data layer and FTS search."""
+import sqlite3
 import time
 
 import pytest
@@ -138,6 +139,47 @@ async def test_undated_item_fallback_and_late_date(db):
     await db.upsert_items(sid, [_item("g1", title="dated now", published_at=t)])
     lst, _ = await db.list_items(source_id=sid)
     assert lst[0]["published_at"] == pytest.approx(t)
+
+
+@pytest.mark.asyncio
+async def test_future_date_rejected(db):
+    sid = await db.create_source("https://example.com/rss", "Ex", "rss")
+    # a feed with a broken CMS timezone can publish dates hours in the future;
+    # those must be stored as missing so the first-seen fallback applies
+    future = time.time() + 7200
+    await db.upsert_items(sid, [_item("g1", title="future dated", published_at=future)])
+    pub, first_seen = await _raw_pub_first_seen(db, sid, "g1")
+    assert pub is None and first_seen is not None
+    lst, _ = await db.list_items(source_id=sid)
+    assert lst[0]["published_at"] == pytest.approx(first_seen)
+    # refreshing with the same bogus date must not re-plant it
+    await db.upsert_items(sid, [_item("g1", title="future dated", published_at=future)])
+    pub, _ = await _raw_pub_first_seen(db, sid, "g1")
+    assert pub is None
+    # small clock skew within the tolerance is kept
+    skew = time.time() + 60
+    await db.upsert_items(sid, [_item("g2", title="skew", published_at=skew)])
+    pub2, _ = await _raw_pub_first_seen(db, sid, "g2")
+    assert pub2 == pytest.approx(skew)
+
+
+@pytest.mark.asyncio
+async def test_migrate_heals_stored_future_dates(db):
+    sid = await db.create_source("https://example.com/rss", "Ex", "rss")
+    past = time.time() - 100
+    future = time.time() + 7200
+    await db.upsert_items(sid, [_item("g1", published_at=past), _item("g2")])
+    # plant a future date behind the back of upsert_items (pre-fix row), then
+    # re-run the migration; it is idempotent and must heal the bad row only
+    with sqlite3.connect(db.path) as conn:
+        conn.execute("UPDATE items SET published_at=? WHERE guid='g2'", (future,))
+        Database._migrate(conn)
+        row = conn.execute(
+            "SELECT published_at FROM items WHERE guid='g2'").fetchone()
+        assert row[0] is None
+        row = conn.execute(
+            "SELECT published_at FROM items WHERE guid='g1'").fetchone()
+        assert row[0] == pytest.approx(past)
 
 
 @pytest.mark.asyncio
