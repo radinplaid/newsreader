@@ -20,6 +20,11 @@
            autocomplete="off" spellcheck="false">
     <kbd id="searchShortcut">/</kbd>
   </div>
+  <select id="sortSel" class="select" title="Sort order">
+    <option value="new">Newest first</option>
+    <option value="old">Oldest first</option>
+    <option value="rank">Relevance</option>
+  </select>
   <button id="themeBtn" class="icon-btn" aria-label="Toggle theme">☾</button>
   <button id="addBtn" class="btn primary" title="Add a news source">+ Source</button>
 </header>
@@ -59,11 +64,6 @@
   <main class="main">
     <div class="toolbar">
       <div id="filterChips" class="chips"></div>
-      <select id="sortSel" class="select" title="Sort order">
-        <option value="new">Newest first</option>
-        <option value="old">Oldest first</option>
-        <option value="rank">Relevance</option>
-      </select>
     </div>
     <div id="itemList" class="items"></div>
     <div id="sentinel" class="sentinel"></div>
@@ -136,6 +136,14 @@
     </div>
   </form>
 </dialog>
+
+<!-- persistent source-failure notes (dismissed manually) -->
+<div id="notes" class="notes">
+  <div id="notesHead" class="notes-head hidden">
+    <span id="notesCount"></span>
+    <button id="notesDismissAll" class="note-toggle">Dismiss all</button>
+  </div>
+</div>
 
 <div id="toast" class="toast" role="status"></div>
 

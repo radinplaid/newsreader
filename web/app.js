@@ -80,6 +80,56 @@ function toast(msg, isError = false) {
   toastTimer = setTimeout(() => t.classList.remove("show"), 3200);
 }
 
+/* ---------------- persistent failure notes ----------------
+   One card per failed source update. Never auto-dismissed; the error
+   detail (HTTP status, response excerpt, exception chain) is collapsed
+   behind a Details toggle. Errors are deduplicated per source + text so
+   polls and sidebar loads don't stack duplicates. */
+const noteState = { seen: new Set() };
+
+function notesChanged() {
+  const notes = $("#notes");
+  const n = notes.querySelectorAll(".note").length;
+  $("#notesHead").classList.toggle("hidden", n < 2);
+  $("#notesCount").textContent = n ? `${n} source(s) failed to update` : "";
+}
+
+function showSourceError(sourceId, name, errText) {
+  const key = `s${sourceId}:${errText || ""}`;
+  if (noteState.seen.has(key)) return;
+  noteState.seen.add(key);
+  errText = errText || "unknown error";
+  const short = errText.length > 180 ? `${errText.slice(0, 180)}…` : errText;
+  const details = el("pre", { class: "note-details hidden" }, errText);
+  const toggle = el("button", {
+    class: "note-toggle", textContent: "Details ▸",
+    onclick: () => {
+      const hidden = details.classList.toggle("hidden");
+      toggle.textContent = hidden ? "Details ▸" : "Details ▾";
+    },
+  });
+  const card = el("div", { class: "note", role: "alert" },
+    el("div", { class: "note-head" },
+      el("span", { class: "note-title" }, `⚠ Failed to update “${name}”`),
+      el("button", {
+        class: "x", title: "Dismiss this notification", textContent: "✕",
+        onclick: () => { card.remove(); notesChanged(); },
+      })),
+    el("div", { class: "note-body" }, short),
+    el("div", { class: "note-foot" }, toggle),
+    details);
+  $("#notes").append(card);
+  notesChanged();
+}
+
+function checkSourceErrors(sources) {
+  for (const s of sources || []) {
+    if (s.last_status === "error" && s.last_error) {
+      showSourceError(s.id, s.name || s.url, s.last_error);
+    }
+  }
+}
+
 /* clipboard write with an execCommand fallback for non-secure contexts */
 async function copyText(text) {
   if (navigator.clipboard && window.isSecureContext) {
@@ -144,6 +194,7 @@ async function loadSidebar() {
     renderCategories();
     renderSources();
     renderTags();
+    checkSourceErrors(state.sources);
   } catch (err) {
     toast(`Failed to load sidebar: ${err.message}`, true);
   }
@@ -562,9 +613,100 @@ function closeDetail() {
   loadItems(false).catch(() => {});  // refresh tag chips silently
 }
 
-/* ---------------- refresh flow ---------------- */
+/* ---------------- refresh flow ----------------
+   Refresh state arrives pushed over SSE (/api/events): start snapshot,
+   one event per finished source (progress + immediate failure notes),
+   and a done event (summary toast + reload). No idle polling. Runs that
+   finished before the page loaded are baselined and not announced.
+   If the stream can't be established, a polling fallback takes over. */
 let pollTimer;
+let evtSource = null;
+let pollFallback = false;
 let refreshWasRunning = false;
+let lastFinishedSeen = null;
+
+function handleRefreshEvent(ev) {
+  if (ev.type === "snapshot") {
+    if (ev.running) {
+      renderRefreshProgress(ev);
+      $("#refreshIcon").textContent = "◐";
+      if (lastFinishedSeen === null) lastFinishedSeen = 0;  // run in flight: await its done
+    } else if (lastFinishedSeen === null) {
+      lastFinishedSeen = ev.finished_at;   // boot baseline
+    }
+    return;
+  }
+  if (ev.type === "source") {
+    renderRefreshProgress({ running: true, total: ev.total, done: ev.done,
+      inserted: ev.inserted, errors: ev.errors, current: ev.result.source });
+    $("#refreshIcon").textContent = "◐";
+    if (ev.result.status === "error" && ev.result.error) {
+      showSourceError(ev.result.source_id, ev.result.source, ev.result.error);
+    }
+    return;
+  }
+  if (ev.type === "done") {
+    const status = ev.status || {};
+    renderRefreshProgress(status);
+    $("#refreshIcon").textContent = "⟳";
+    if (lastFinishedSeen === null) {
+      lastFinishedSeen = status.finished_at;
+    } else if (status.finished_at && status.finished_at !== lastFinishedSeen) {
+      lastFinishedSeen = status.finished_at;
+      announceRefreshDone(status);
+    }
+  }
+}
+
+function connectRefreshStream() {
+  if (pollFallback || !window.EventSource) { startPollFallback(); return; }
+  if (evtSource) return;
+  evtSource = new EventSource("/api/events");
+  evtSource.onmessage = (msg) => {
+    try { handleRefreshEvent(JSON.parse(msg.data)); }
+    catch (_e) { /* malformed frame: ignore */ }
+  };
+  evtSource.onerror = () => {
+    // CLOSED means the stream is really gone (e.g. old server without
+    // /api/events); CONNECTING is the browser's automatic reconnect.
+    if (evtSource && evtSource.readyState === EventSource.CLOSED) {
+      evtSource = null;
+      startPollFallback();
+    }
+  };
+}
+
+function startPollFallback() {
+  if (pollTimer || pollFallback) return;
+  pollFallback = true;
+  const tick = async () => {
+    try {
+      const status = await api("/refresh/status");
+      if (status.running) {
+        renderRefreshProgress(status);
+        $("#refreshIcon").textContent = "◐";
+        pollTimer = setTimeout(tick, 800);
+        return;
+      }
+      renderRefreshProgress(status);
+      $("#refreshIcon").textContent = "⟳";
+      if (lastFinishedSeen === null) {
+        lastFinishedSeen = status.finished_at;
+      } else if (status.finished_at && status.finished_at !== lastFinishedSeen) {
+        lastFinishedSeen = status.finished_at;
+        announceRefreshDone(status);
+      }
+    } catch (_e) { /* server hiccup; retry on the next tick */ }
+    pollTimer = setTimeout(tick, 5000);
+  };
+  tick();
+}
+
+function pollRefresh() {   // one-shot sync right after triggering a run
+  api("/refresh/status")
+    .then((status) => handleRefreshEvent({ type: "snapshot", ...status }))
+    .catch(() => {});
+}
 
 function renderRefreshProgress(status) {
   const bar = $("#refreshBar"), fill = $("#refreshBarFill"), label = $("#refreshStatus");
@@ -603,30 +745,23 @@ function renderRefreshProgress(status) {
   }, 900);
 }
 
-function pollRefresh() {
-  clearTimeout(pollTimer);
-  const poll = async () => {
-    try {
-      const status = await api("/refresh/status");
-      renderRefreshProgress(status);
-      $("#refreshIcon").textContent = status.running ? "◐" : "⟳";
-      if (status.running) {
-        pollTimer = setTimeout(poll, 800);
-        return;
-      }
-      if (status.finished_at && status.total > 0) {
-        const bits = [`${status.total} sources`];
-        if (status.skipped) bits.push(`${status.skipped} skipped (recent)`);
-        if (status.errors) bits.push(`${status.errors} failed`);
-        toast(`Refresh done: +${status.inserted} new items (${bits.join(", ")})`);
-        refreshSidebar();
-        loadItems(true).catch(() => {});
-      } else if (status.finished_at && status.skipped > 0) {
-        toast(`All sources are up to date — ${status.skipped} skipped (updated recently)`);
-      }
-    } catch (_e) { /* server hiccup; stop polling */ }
-  };
-  poll();
+function announceRefreshDone(status) {
+  if (status.total > 0) {
+    const bits = [`${status.total} sources`];
+    if (status.skipped) bits.push(`${status.skipped} skipped (recent)`);
+    if (status.errors) bits.push(`${status.errors} failed`);
+    toast(`Refresh done: +${status.inserted} new items (${bits.join(", ")})`,
+          status.errors > 0);
+    refreshSidebar();
+    loadItems(true).catch(() => {});
+  } else if (status.skipped > 0) {
+    toast(`All sources are up to date — ${status.skipped} skipped (updated recently)`);
+  }
+  for (const r of status.results || []) {
+    if (r.status === "error" && r.error) {
+      showSourceError(r.source_id, r.source, r.error);
+    }
+  }
 }
 
 async function startRefresh() {
@@ -663,6 +798,10 @@ document.addEventListener("keydown", (ev) => {
 });
 $("#sortSel").addEventListener("change", (ev) => { state.sort = ev.target.value; refresh(); });
 $("#refreshBtn").addEventListener("click", startRefresh);
+$("#notesDismissAll").addEventListener("click", () => {
+  for (const n of document.querySelectorAll("#notes .note")) n.remove();
+  notesChanged();
+});
 $("#detailClose").addEventListener("click", closeDetail);
 $("#detail").addEventListener("click", (ev) => {
   if (!ev.target.closest(".detail-inner") && !ev.target.closest(".detail-close")) closeDetail();
@@ -853,4 +992,4 @@ $("#themeBtn").textContent = saved === "light" ? "☀" : "☾";
 // boot
 refreshSidebar();
 loadItems(true);
-pollRefresh();
+connectRefreshStream();

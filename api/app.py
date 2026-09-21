@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -9,9 +10,10 @@ from contextlib import asynccontextmanager
 
 import crawler
 from crawler.base import FetchError
+from crawler.pool import shutdown_parse_pool
 from fastapi import FastAPI, HTTPException, Query, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -36,6 +38,7 @@ async def lifespan(app: FastAPI):
     yield
     if app.state.auto_task:
         app.state.auto_task.cancel()
+    shutdown_parse_pool()
     await app.state.db.close()
 
 
@@ -372,6 +375,33 @@ async def refresh(body: RefreshIn, db: Database = Depends(get_db), fetcher: Fetc
 @app.get("/api/refresh/status")
 async def refresh_status(fetcher: Fetcher = Depends(get_fetcher)):
     return fetcher.snapshot()
+
+
+@app.get("/api/events")
+async def events(request: Request, fetcher: Fetcher = Depends(get_fetcher)):
+    """Server-sent events: refresh start/progress/completion (and failures),
+    pushed to the client so it never needs to poll while idle."""
+    queue = fetcher.events.subscribe()
+
+    def sse(data: dict) -> str:
+        return f"data: {json.dumps(data, default=str)}\n\n"
+
+    async def stream():
+        try:
+            # snapshot first so late/re-connecting clients sync up
+            yield sse({"type": "snapshot", **fetcher.snapshot()})
+            while True:
+                try:
+                    ev = await asyncio.wait_for(queue.get(), timeout=15.0)
+                    yield sse(ev)
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"   # comment frame; also detects dead peers
+        finally:
+            fetcher.events.unsubscribe(queue)
+
+    return StreamingResponse(stream(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache",
+                                      "X-Accel-Buffering": "no"})
 
 
 # ----------------------------------------------------------------- static

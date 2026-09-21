@@ -34,7 +34,7 @@ def _fetch(url):
                                               "Accept-Encoding": "gzip, deflate"}) as http:
             ctx = FetchContext(source={"id": 0, "url": url, "name": "", "etag": "",
                                        "last_modified": "", "config": {}},
-                               client=http, known_guids=set(),
+                               client=http, known_dates={},
                                config=plugin.default_config(),
                                logger=__import__("logging").getLogger("live"))
             result = await plugin.fetch(ctx)

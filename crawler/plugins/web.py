@@ -22,6 +22,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from crawler import register
 from crawler.base import Plugin, FetchContext, FetchResult, ParsedItem
+from crawler.pool import run_parse
 from crawler.textutil import (absolutize, clean, first_image_src, find_date_in_text,
                               host_of, parse_date, soup_from, text_of)
 
@@ -396,6 +397,44 @@ def _discover_feed_url(soup, base_url: str) -> str | None:
     return None
 
 
+def _discover_feed_url_from(page_text: str, base_url: str) -> str | None:
+    """Same as _discover_feed_url but takes raw HTML (off-loop friendly)."""
+    return _discover_feed_url(soup_from(page_text), base_url)
+
+
+_FEED_PROBE_RE = re.compile(r"<(?:rss|feed|rdf)\b", re.I)
+
+
+def _looks_like_feed(text: str) -> bool:
+    """True when the fetched document is itself an RSS/Atom/RDF feed.
+
+    Sites sometimes keep feeds under non-obvious paths (e.g.
+    cbc.ca/webfeed/rss/rss-topstories), so a source registered as a generic
+    page can receive XML. Parsing that as HTML yields junk, so detect it
+    and hand the document to the feed parser instead."""
+    head = text.lstrip()[:600]
+    if head.startswith("<?xml"):
+        return True
+    return bool(_FEED_PROBE_RE.search(head))
+
+
+def _find_next_page(selector: str | None, html: str, current_url: str) -> str | None:
+    soup = soup_from(html)
+    node = soup.select_one(selector) if selector else soup.find("link", rel=lambda v: v and "next" in v)
+    if node is None:
+        for a in soup.find_all("a", rel=True):
+            rels = a.get("rel") or []
+            if any(r.lower() == "next" for r in rels) and a.get("href"):
+                node = a
+                break
+    if node is None or not node.get("href"):
+        return None
+    href = node["href"]
+    if href == current_url:
+        return None
+    return absolutize(current_url, href)
+
+
 async def _fetch_feed(ctx, feed_url: str) -> tuple[list, str | None]:
     """Fetch and parse a discovered feed (delegates to the rss parser)."""
     from crawler.plugins.rss import _parse_feed
@@ -414,7 +453,7 @@ class WebPlugin(Plugin):
     priority = 0
 
     def default_config(self) -> dict:
-        return {"max_items": 300, "fetch_content": True, "content_fetch_limit": 12,
+        return {"max_items": 300, "fetch_content": True, "content_fetch_limit": 24,
                 "max_pages": 3}
 
     async def fetch(self, ctx: FetchContext) -> FetchResult:
@@ -437,17 +476,31 @@ class WebPlugin(Plugin):
                 if text is None:
                     break
                 last_text = text
-                page_items = extract_listing(text, next_url)
+                if pages == 0 and _looks_like_feed(text):
+                    # the "page" is actually a feed document: parse it as one
+                    from crawler.plugins.rss import _parse_feed
+                    parsed, source_name = await asyncio.to_thread(_parse_feed, text)
+                    if parsed:
+                        limit = int(ctx.config.get("max_items", 300))
+                        return FetchResult(
+                            items=[ParsedItem(**i.to_row()) for i in parsed[:limit]],
+                            source_name=source_name)
+                    break   # XML but not a usable feed: fall through to scraping
+                # lxml parsing holds the GIL in long C chunks: parse in a
+                # worker process so the event loop never stalls
+                page_items = await run_parse(extract_listing, text, next_url)
                 seen_guids = {i["guid"] for i in items}
                 items.extend(i for i in page_items if i["guid"] not in seen_guids)
                 pages += 1
                 if len(page_items) >= 5:
-                    next_url = self._next_page(ctx, text, next_url)
+                    next_url = await run_parse(_find_next_page,
+                                               ctx.config.get("next_page_selector"),
+                                               text, next_url)
                 else:
                     next_url = None
             if not items and last_text is not None:
                 # maybe the URL is a single article page
-                article = extract_article(last_text, url)
+                article = await run_parse(extract_article, last_text, url)
                 if article.get("title") and (article.get("published_at") or article.get("content")):
                     items = [article]
 
@@ -480,8 +533,7 @@ class WebPlugin(Plugin):
         """If the page advertises a same-host feed, try to use it. On success
         the feed URL is persisted in the source config so later refreshes skip
         the discovery round-trip."""
-        soup = soup_from(page_text)
-        feed_url = _discover_feed_url(soup, page_url)
+        feed_url = await run_parse(_discover_feed_url_from, page_text, page_url)
         if not feed_url or feed_url == page_url:
             return [], None
         parsed, name = await _fetch_feed(ctx, feed_url)
@@ -489,27 +541,19 @@ class WebPlugin(Plugin):
             return [], None
         return [i.to_row() for i in parsed], name
 
-    def _next_page(self, ctx: FetchContext, html: str, current_url: str) -> str | None:
-        soup = soup_from(html)
-        selector = ctx.config.get("next_page_selector")
-        node = soup.select_one(selector) if selector else soup.find("link", rel=lambda v: v and "next" in v)
-        if node is None:
-            for a in soup.find_all("a", rel=True):
-                rels = a.get("rel") or []
-                if any(r.lower() == "next" for r in rels) and a.get("href"):
-                    node = a
-                    break
-        if node is None or not node.get("href"):
-            return None
-        href = node["href"]
-        if href == current_url:
-            return None
-        return absolutize(current_url, href)
-
     async def _enrich_from_pages(self, ctx: FetchContext, items: list[dict]) -> None:
-        """Fetch article pages for new items to add content/date/image."""
-        limit = int(ctx.config.get("content_fetch_limit", 12))
-        need = [i for i in items if i["guid"] not in ctx.known_guids][:limit]
+        """Fetch article pages for new items and for items still missing a
+        date in the DB (backfill): content/date/image land in the DB via
+        the upsert. Items the DB already dates are left alone, so the
+        per-refresh budget reaches the undated stragglers."""
+        limit = int(ctx.config.get("content_fetch_limit", 24))
+
+        def needs(i: dict) -> bool:
+            stored = ctx.known_dates.get(i["guid"])
+            return (i["guid"] not in ctx.known_dates
+                    or (stored is None and not i.get("published_at")))
+
+        need = [i for i in items if needs(i)][:limit]
         if not need:
             return
         sem = asyncio.Semaphore(6)
@@ -520,7 +564,7 @@ class WebPlugin(Plugin):
                     text = await ctx.get_text(item["url"])
                     if text is None:
                         return
-                    article = extract_article(text, item["url"])
+                    article = await run_parse(extract_article, text, item["url"])
                 except Exception as exc:  # noqa: BLE001 - enrichment is best effort
                     ctx.logger.debug("enrich failed for %s: %s", item["url"], exc)
                     return

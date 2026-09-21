@@ -86,7 +86,7 @@ class RSSPlugin(Plugin):
     patterns = (
         r"\.(xml|rss|atom)([?#]|$)",
         r"/(feed|rss|atom)/?([?#]|$)",
-        r"/feeds?/",
+        r"/(rss|webfeed|feeds?)/",
         r"feedburner\.com/",
     )
     priority = 30

@@ -6,7 +6,7 @@ from crawler import find_plugin
 from crawler.base import FetchContext
 from crawler.plugins.arxiv import parse_abs_page, parse_search_page
 from crawler.plugins.rss import _parse_feed
-from crawler.plugins.web import extract_article, extract_listing
+from crawler.plugins.web import WebPlugin, extract_article, extract_listing
 
 RSS_XML = """<?xml version="1.0"?>
 <rss version="2.0" xmlns:media="http://search.yahoo.com/mrss/"><channel>
@@ -177,6 +177,25 @@ def test_rss_parse_feed():
     assert second.content == "Full body text here"
 
 
+@pytest.mark.asyncio
+async def test_parse_pool_roundtrip():
+    """run_parse executes off the loop (process pool by default) and matches
+    the direct call. A worker that dies degrades to a thread, so a pool
+    failure must not change results."""
+    import asyncio
+    from crawler.pool import run_parse, shutdown_parse_pool
+
+    async def hammer():
+        return await asyncio.gather(*(
+            run_parse(extract_listing, WEBFLOW_HTML, "https://ex.com/blog")
+            for _ in range(4)))
+
+    pooled, direct = await asyncio.gather(hammer(), asyncio.to_thread(
+        extract_listing, WEBFLOW_HTML, "https://ex.com/blog"))
+    assert pooled == [direct] * 4
+    shutdown_parse_pool()
+
+
 def test_web_listing_webflow_cards():
     items = extract_listing(WEBFLOW_HTML, "https://ex.com/blog")
     by_url = {i["url"]: i for i in items}
@@ -271,6 +290,9 @@ def test_arxiv_parse_search_page():
 def test_registry_routing():
     assert find_plugin("https://www.theguardian.com/x/rss").name == "rss"
     assert find_plugin("https://metr.org/feed.xml").name == "rss"
+    # segment-style feed paths (e.g. CBC) must not fall through to the scraper
+    assert find_plugin("https://www.cbc.ca/webfeed/rss/rss-topstories").name == "rss"
+    assert find_plugin("https://example.org/rss/headlines").name == "rss"
     assert find_plugin("https://www.youtube.com/playlist?list=PLxyz").name == "youtube"
     assert find_plugin("https://arxiv.org/search/?query=mt").name == "arxiv"
     assert find_plugin("https://arxiv.org/abs/2609.14795").name == "arxiv"
@@ -278,9 +300,26 @@ def test_registry_routing():
     assert find_plugin("https://some-blog.example/posts").name == "web"
 
 
-def _mock_ctx(handler):
+def _mock_ctx(handler, url="https://example.com/x"):
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    return FetchContext(source={}, client=client, known_guids=set(), config={})
+    source = {"id": 0, "url": url, "name": "", "etag": "", "last_modified": "",
+              "config": {}}
+    return FetchContext(source=source, client=client, known_dates={}, config={})
+
+
+@pytest.mark.asyncio
+async def test_web_plugin_parses_feed_document():
+    """A URL registered as a generic page can still serve RSS/Atom XML
+    (e.g. cbc.ca/webfeed/rss/...): the scraper must parse it as a feed,
+    not as HTML."""
+    def handler(request):
+        return httpx.Response(200, text=RSS_XML)
+
+    ctx = _mock_ctx(handler, url="https://www.cbc.ca/webfeed/rss/rss-topstories")
+    result = await WebPlugin().fetch(ctx)
+    await ctx.client.aclose()
+    assert result.source_name == "Sample Feed"
+    assert [i.title for i in result.items] == ["First post", "Second post"]
 
 
 @pytest.mark.asyncio

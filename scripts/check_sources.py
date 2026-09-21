@@ -37,7 +37,7 @@ async def check(url: str, client: httpx.AsyncClient, name: str = "") -> dict:
     config = plugin.default_config()
     ctx = FetchContext(source={"id": 0, "url": url, "name": name, "etag": "",
                                "last_modified": "", "config": {}},
-                       client=client, known_guids=set(), config=config,
+                       client=client, known_dates={}, config=config,
                        logger=logging.getLogger("check"))
     started = time.time()
     try:

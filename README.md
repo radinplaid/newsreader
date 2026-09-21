@@ -12,6 +12,20 @@ serverless HTML5 web client (plain static files — no build step, no framework)
 * **Many sources, parallel downloads** — every refresh runs all enabled
   sources concurrently (bounded semaphore, default 24 parallel fetches),
   with ETag/Last-Modified conditional requests so unchanged feeds are nearly free.
+  Parsing happens in a small process pool, so the API stays responsive
+  even while large pages are being parsed.
+* **Failure notifications** — when a source fails to update, the web client
+  shows a persistent notification (no timeout; dismissed manually) naming the
+  source. The HTTP status, URL and a response excerpt are included for
+  debugging, collapsed behind a "Details" toggle by default. The sidebar
+  marks failing sources with a ⚠ badge, and a refresh summary toast counts
+  the failures.
+* **Reliable dates** — dates are parsed from feeds, listing cards (`<time>`,
+  meta tags, text patterns) and article pages. Items still missing a date are
+  backfilled by scraping the article page / video info, bounded per refresh
+  and prioritized until the backlog is resolved. Anything that still has no
+  date falls back to the date the item was first seen, and undated items sort
+  after dated ones in both sort orders.
 * **Many items, fast** — SQLite (WAL) with indexes handles 10,000s of items
   comfortably; the listing endpoint is paginated and index-driven.
 * **Full text search** — FTS5 index over title, summary and article content,
@@ -126,6 +140,7 @@ api/            FastAPI app: JSON API under /api, serves web/ at /
 fetcher.py      parallel refresh orchestrator (semaphore-bounded, per-source isolation)
 crawler/
   base.py       Plugin, FetchContext, FetchResult, ParsedItem
+  pool.py       process pool for CPU-bound parsing (GIL-free, thread fallback)
   __init__.py   plugin registry + auto-discovery
   textutil.py   date parsing, cleaning, image extraction helpers
   plugins/      rss.py · web.py · youtube.py · arxiv.py (drop more files here)
@@ -164,6 +179,8 @@ PATCH  /api/categories/{id}            {"name"}
 DELETE /api/categories/{id}
 POST   /api/refresh                    {"source_id"?}  — starts a background run
 GET    /api/refresh/status             progress + per-source results
+GET    /api/events                     server-sent events: refresh start/progress/
+                                       completion + per-source failures (SSE)
 ```
 
 CORS is open, so the `web/` folder can be hosted anywhere (GitHub Pages, S3, …)
@@ -188,6 +205,8 @@ works over the API via `GET /api/sources/export` and
 | `NR_HOST` / `NR_PORT` | `127.0.0.1` / `8000` | bind address (`python -m api`, or override with `--host` / `--port`) |
 | `NR_MAX_CONCURRENCY` | `24` | parallel source fetches per refresh |
 | `NR_REQUEST_TIMEOUT` | `30` | per-request timeout (s) |
+| `NR_DB_READERS` | `4` | pooled SQLite read connections (writes stay serialized) |
+| `NR_PARSE_WORKERS` | `min(4, cores)` | worker processes for HTML/XML parsing (`0` = parse in threads) |
 | `NR_REFRESH_INTERVAL_MIN` | `0` (off) | background auto-refresh interval |
 | `NR_MIN_REFRESH_MINUTES` | `15` | skip sources refreshed more recently than this (refresh-all / auto-refresh; `0` disables, per-source refresh with `"force": true` bypasses) |
 
@@ -200,8 +219,14 @@ sources, `{"fetch_video_dates": true, "date_fetch_limit": 60}` for YouTube,
 
 * 1000+ sources: one `asyncio` task per source, capped by a shared semaphore;
   a failing/slow source never blocks or breaks others (per-source error state
-  is recorded and shown in the UI). Conditional GETs make steady-state
-  refreshes cheap.
+  is recorded, shown in the UI and surfaced as a dismissible notification).
+  Conditional GETs make steady-state refreshes cheap.
+* The server never freezes during refreshes: lxml/BeautifulSoup parsing runs
+  in a small process pool (`crawler/pool.py`, GIL-free — the event loop
+  measured p95 3 ms while a 1.5 s parse of a 0.7 MB page was in flight),
+  pure-Python feed/yt-dlp work uses worker threads, and the SQLite layer
+  keeps a dedicated writer plus a pool of reader connections so API reads
+  don't queue behind refresh writes (WAL).
 * 10,000+ items: pagination with covering indexes, `COUNT(*)` only over the
   filtered set, FTS5 external-content index (no duplicated blobs), WAL mode for
   concurrent readers.

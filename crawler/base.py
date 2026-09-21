@@ -59,7 +59,7 @@ class FetchContext:
 
     source: dict                      # sources table row
     client: httpx.AsyncClient
-    known_guids: set[str]
+    known_dates: dict[str, float | None]   # guid -> stored published_at
     config: dict                      # plugin defaults merged with source config
     logger: logging.Logger | logging.LoggerAdapter = field(default_factory=logging.getLogger)
     etag: str = ""                    # captured from responses, persisted by the fetcher

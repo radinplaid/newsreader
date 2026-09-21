@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS items (
     image_url    TEXT NOT NULL DEFAULT '',
     extra        TEXT NOT NULL DEFAULT '{}',
     fetched_at   REAL NOT NULL,
+    first_seen_at REAL,
     starred      INTEGER NOT NULL DEFAULT 0,
     dismissed    INTEGER NOT NULL DEFAULT 0,
     UNIQUE (source_id, guid)
@@ -132,7 +133,8 @@ _ITEM_TAGS = ("(SELECT json_group_array(t.name) FROM"
               "  WHERE jt.item_id = i.id ORDER BY t2.name) t) AS tags")
 _ITEM_COLS = f"""
     i.id, i.guid, i.title, i.summary, i.url, i.image_url, i.author,
-    i.published_at, i.fetched_at, i.starred,
+    COALESCE(i.published_at, i.first_seen_at) AS published_at,
+    i.fetched_at, i.starred,
     i.source_id, s.name AS source_name, s.url AS source_url,
     c.id AS category_id, c.name AS category_name,
     {_ITEM_TAGS}
@@ -140,12 +142,20 @@ _ITEM_COLS = f"""
 
 
 class Database:
-    """Repository over aiosqlite."""
+    """Repository over aiosqlite.
+
+    Reads go through a small pool of connections so API requests never queue
+    behind refresh writes on a single worker thread (WAL lets readers and the
+    writer work concurrently); all writes share one dedicated connection so
+    write transactions stay serialized.
+    """
 
     def __init__(self, path: str | None = None):
         self.path = os.path.abspath(path or settings.nr_db_path)
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
-        self._conn = None
+        self._writer: aiosqlite.Connection | None = None
+        self._readers: list[aiosqlite.Connection] = []
+        self._next_reader = 0
 
     async def init(self):
         """Initialize the schema synchronously at startup if needed, then setup async."""
@@ -155,6 +165,10 @@ class Database:
         self._migrate(conn)
         conn.commit()
         conn.close()
+        # build the pools up front so requests never race a lazy init
+        self._readers = [await self._open_conn()
+                         for _ in range(max(1, settings.nr_db_readers))]
+        self._writer = await self._open_conn()
 
     @staticmethod
     def _migrate(conn: sqlite3.Connection) -> None:
@@ -164,33 +178,49 @@ class Database:
             conn.execute("ALTER TABLE items ADD COLUMN starred INTEGER NOT NULL DEFAULT 0")
         if "dismissed" not in cols:
             conn.execute("ALTER TABLE items ADD COLUMN dismissed INTEGER NOT NULL DEFAULT 0")
+        if "first_seen_at" not in cols:
+            conn.execute("ALTER TABLE items ADD COLUMN first_seen_at REAL")
+            # existing rows: last fetch is the best available "added" date
+            conn.execute("UPDATE items SET first_seen_at = fetched_at "
+                         "WHERE first_seen_at IS NULL")
         scols = {r[1] for r in conn.execute("PRAGMA table_info(sources)")}
         if "hidden" not in scols:
             conn.execute("ALTER TABLE sources ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0")
 
     # -- connections ------------------------------------------------------
+    async def _open_conn(self) -> aiosqlite.Connection:
+        conn = await aiosqlite.connect(self.path, timeout=30)
+        conn.row_factory = aiosqlite.Row
+        await conn.execute("PRAGMA foreign_keys=ON")
+        await conn.execute("PRAGMA busy_timeout=30000")
+        return conn
+
     async def get_conn(self) -> aiosqlite.Connection:
-        if self._conn is None:
-            self._conn = await aiosqlite.connect(self.path, timeout=30)
-            self._conn.row_factory = aiosqlite.Row
-            await self._conn.execute("PRAGMA foreign_keys=ON")
-            await self._conn.execute("PRAGMA busy_timeout=30000")
-        return self._conn
-        
+        """A pooled read connection (round-robin over nr_db_readers)."""
+        if not self._readers:
+            self._readers = [await self._open_conn()]
+        conn = self._readers[self._next_reader % len(self._readers)]
+        self._next_reader += 1
+        return conn
+
     async def close(self):
-        if self._conn:
-            await self._conn.close()
-            self._conn = None
+        conns = [*self._readers, self._writer]
+        self._readers = []
+        self._writer = None
+        for conn in conns:
+            if conn:
+                await conn.close()
 
     @asynccontextmanager
     async def write(self):
-        """Transaction context manager for aiosqlite."""
-        conn = await self.get_conn()
+        """Transaction context manager over the dedicated write connection."""
+        if self._writer is None:
+            self._writer = await self._open_conn()
         try:
-            yield conn
-            await conn.commit()
+            yield self._writer
+            await self._writer.commit()
         except Exception:
-            await conn.rollback()
+            await self._writer.rollback()
             raise
 
     # -- categories -------------------------------------------------------
@@ -314,19 +344,21 @@ class Database:
                 return cur.rowcount > 0
 
     # -- items -------------------------------------------------------------
-    async def known_guids(self, source_id: int) -> set[str]:
+    async def known_dates(self, source_id: int) -> dict[str, float | None]:
+        """guid -> stored published_at (None when the item has no date yet);
+        plugins use it to backfill only what is still missing."""
         conn = await self.get_conn()
         async with conn.execute(
-            "SELECT guid FROM items WHERE source_id=?", (source_id,)
+            "SELECT guid, published_at FROM items WHERE source_id=?", (source_id,)
         ) as cur:
             rows = await cur.fetchall()
-            return {r["guid"] for r in rows}
+            return {r["guid"]: r["published_at"] for r in rows}
 
     async def upsert_items(self, source_id: int, items: list[dict]) -> tuple[int, int]:
         """Insert/update parsed items. Returns (inserted, updated)."""
         if not items:
             return (0, 0)
-        existing = await self.known_guids(source_id)
+        existing = await self.known_dates(source_id)
         now = time.time()
         rows = []
         upd_rows = []
@@ -340,7 +372,7 @@ class Database:
                 source_id, guid, it.get("url") or "", it.get("title") or "",
                 it.get("summary") or "", it.get("content") or "", it.get("author") or "",
                 it.get("published_at"), it.get("image_url") or "",
-                json.dumps(it.get("extra") or {}, ensure_ascii=False), now,
+                json.dumps(it.get("extra") or {}, ensure_ascii=False), now, now,
             ))
             if guid in existing:
                 upd_rows.append(guid)
@@ -350,8 +382,8 @@ class Database:
                 await conn.executemany(
                     """
                     INSERT INTO items (source_id, guid, url, title, summary, content, author,
-                                       published_at, image_url, extra, fetched_at)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                                       published_at, image_url, extra, fetched_at, first_seen_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
                     ON CONFLICT(source_id, guid) DO UPDATE SET
                         url=excluded.url, title=excluded.title,
                         summary=CASE WHEN length(excluded.summary) > length(items.summary)
@@ -443,9 +475,13 @@ class Database:
         if sort == "rank" and match:
             order = "ORDER BY f.frank"
         elif sort == "old":
-            order = "ORDER BY (i.published_at IS NULL) DESC, i.published_at ASC, i.id ASC"
+            # dated items oldest-first; undated tail by (ascending) added date
+            order = ("ORDER BY (i.published_at IS NULL) ASC, i.published_at ASC, "
+                     "i.first_seen_at ASC, i.id ASC")
         else:
-            order = "ORDER BY (i.published_at IS NULL) ASC, i.published_at DESC, i.id DESC"
+            # dated items newest-first; undated tail by (descending) added date
+            order = ("ORDER BY (i.published_at IS NULL) ASC, i.published_at DESC, "
+                     "i.first_seen_at DESC, i.id DESC")
         limit = max(1, min(int(limit), 200))
         offset = max(0, int(offset))
         select = self._SELECT if include_content else self._SELECT_LIST

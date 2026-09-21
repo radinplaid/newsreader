@@ -26,7 +26,22 @@ USER_AGENT = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
 
 
 def _error_text(exc: BaseException) -> str:
-    """Readable error line; walks the cause chain when str(exc) is empty."""
+    """Readable error line; walks the cause chain when str(exc) is empty.
+
+    HTTP errors lead with the status code and a one-line response excerpt so
+    the UI can surface them for debugging (collapsed by default).
+    """
+    if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None:
+        resp = exc.response
+        try:
+            url = resp.request.url
+        except Exception:  # noqa: BLE001 - the request may already be gone
+            url = "?"
+        detail = f"HTTP {resp.status_code} {resp.reason_phrase} from {url}".rstrip()
+        excerpt = " ".join((resp.text or "").split())[:300]
+        if excerpt:
+            detail += f" — response: {excerpt}"
+        return detail[:800]
     detail = str(exc).strip()
     if not detail:
         seen, cur = {id(exc)}, exc.__cause__ or exc.__context__
@@ -43,12 +58,39 @@ class RefreshBusy(RuntimeError):
     pass
 
 
+class EventBus:
+    """Tiny in-process pub-sub; fans refresh events out to SSE subscribers.
+
+    publish() never blocks or raises: a slow client just misses events and
+    re-syncs from the snapshot sent when it (re)connects.
+    """
+
+    def __init__(self) -> None:
+        self._subs: set[asyncio.Queue] = set()
+
+    def subscribe(self) -> asyncio.Queue:
+        q: asyncio.Queue = asyncio.Queue(maxsize=128)
+        self._subs.add(q)
+        return q
+
+    def unsubscribe(self, q: asyncio.Queue) -> None:
+        self._subs.discard(q)
+
+    def publish(self, event: dict) -> None:
+        for q in list(self._subs):
+            try:
+                q.put_nowait(event)
+            except asyncio.QueueFull:
+                pass
+
+
 class Fetcher:
     """Owns refresh runs and their status."""
 
     def __init__(self, db: Database):
         self.db = db
         self._running = False
+        self.events = EventBus()
         self.status: dict = {
             "running": False, "started_at": None, "finished_at": None,
             "total": 0, "done": 0, "skipped": 0, "inserted": 0, "updated": 0,
@@ -107,6 +149,7 @@ class Fetcher:
                              skipped, min_minutes)
                 sources = pending
             self.status["total"] = len(sources)
+            self.events.publish({"type": "snapshot", **self.snapshot()})
             concurrency = max(1, settings.nr_max_concurrency)
             timeout = httpx.Timeout(settings.nr_request_timeout)
             sem = asyncio.Semaphore(concurrency)
@@ -127,11 +170,17 @@ class Fetcher:
                     self.status["errors"] += 1 if result["status"] == "error" else 0
                     self.status["current"] = result["source"]
                     self.status["results"].append(result)
+                    self.events.publish({
+                        "type": "source", "result": result,
+                        **{k: self.status[k] for k in
+                           ("total", "done", "inserted", "errors")},
+                    })
             return self.snapshot()
         finally:
             self._running = False
             self.status["running"] = False
             self.status["finished_at"] = time.time()
+            self.events.publish({"type": "done", "status": self.snapshot()})
 
     async def _refresh_one(self, client: httpx.AsyncClient, src: dict,
                            sem: asyncio.Semaphore) -> dict:
@@ -151,11 +200,18 @@ class Fetcher:
                     plugin = crawler.find_plugin(src["url"])
                     if plugin is None:
                         raise FetchError(f"no plugin can handle {src['url']}")
-                    result["plugin"] = plugin.name
+                if plugin.name == "web":
+                    # self-heal sources stored before a dedicated plugin
+                    # matched their URL: prefer the dedicated match (the
+                    # row's plugin field is updated after the refresh)
+                    better = crawler.find_plugin(src["url"])
+                    if better is not None and better.name != plugin.name:
+                        plugin = better
+                result["plugin"] = plugin.name
                 config = {**plugin.default_config(), **(src.get("config") or {})}
-                known = await self.db.known_guids(src["id"])
+                known = await self.db.known_dates(src["id"])
                 ctx = FetchContext(
-                    source=src, client=client, known_guids=known, config=config,
+                    source=src, client=client, known_dates=known, config=config,
                     logger=logging.LoggerAdapter(log, {"source": name}),
                 )
                 fetched = await plugin.fetch(ctx)

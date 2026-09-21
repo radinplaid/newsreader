@@ -54,7 +54,7 @@ class YouTubePlugin(Plugin):
     priority = 25
 
     def default_config(self) -> dict:
-        return {"max_items": 300, "fetch_video_dates": True, "date_fetch_limit": 60}
+        return {"max_items": 300, "fetch_video_dates": True, "date_fetch_limit": 100}
 
     async def fetch(self, ctx: FetchContext) -> FetchResult:
         url = ctx.source["url"]
@@ -99,8 +99,13 @@ class YouTubePlugin(Plugin):
         return FetchResult(items=items, source_name=source_name)
 
     async def _fetch_dates(self, ctx: FetchContext, items: list[ParsedItem]) -> None:
-        limit = int(ctx.config.get("date_fetch_limit", 60))
-        need = [it for it in items if it.guid not in ctx.known_guids][:limit]
+        limit = int(ctx.config.get("date_fetch_limit", 100))
+        # new videos first, then known-but-still-undated ones (backfill);
+        # videos the DB already dates are never re-extracted, so the
+        # per-refresh budget keeps reaching the undated tail
+        need = [it for it in items
+                if it.guid not in ctx.known_dates
+                or (ctx.known_dates[it.guid] is None and it.published_at is None)][:limit]
         if not need:
             return
         sem = asyncio.Semaphore(6)

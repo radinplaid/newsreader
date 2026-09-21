@@ -1,4 +1,6 @@
 import os
+
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
@@ -12,6 +14,9 @@ class Settings(BaseSettings):
     nr_min_refresh_minutes: float = 15.0
     nr_max_concurrency: int = 24
     nr_request_timeout: float = 30.0
+    nr_db_readers: int = 4
+    nr_parse_workers: int = Field(
+        default_factory=lambda: max(1, min(4, os.cpu_count() or 1)))
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 

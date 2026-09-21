@@ -111,6 +111,35 @@ async def test_delete_source_cascades_items(db):
     assert (await db.list_tags())[0]["item_count"] == 0
 
 
+async def _raw_pub_first_seen(db, sid, guid):
+    conn = await db.get_conn()
+    async with conn.execute(
+        "SELECT published_at, first_seen_at FROM items WHERE source_id=? AND guid=?",
+        (sid, guid)) as cur:
+        row = await cur.fetchone()
+    return row["published_at"], row["first_seen_at"]
+
+
+@pytest.mark.asyncio
+async def test_undated_item_fallback_and_late_date(db):
+    sid = await db.create_source("https://example.com/rss", "Ex", "rss")
+    # new item without any date: API returns the added date as published_at
+    await db.upsert_items(sid, [_item("g1", title="no date yet", published_at=None)])
+    pub, first_seen = await _raw_pub_first_seen(db, sid, "g1")
+    assert pub is None and first_seen is not None
+    lst, _ = await db.list_items(source_id=sid)
+    assert lst[0]["published_at"] == pytest.approx(first_seen)
+    # refreshing without a date must not bump or fake a date
+    await db.upsert_items(sid, [_item("g1", title="no date yet", published_at=None)])
+    pub, first_seen2 = await _raw_pub_first_seen(db, sid, "g1")
+    assert pub is None and first_seen2 == first_seen
+    # a date found later replaces the fallback in the API view
+    t = time.time() - 500
+    await db.upsert_items(sid, [_item("g1", title="dated now", published_at=t)])
+    lst, _ = await db.list_items(source_id=sid)
+    assert lst[0]["published_at"] == pytest.approx(t)
+
+
 @pytest.mark.asyncio
 async def test_fts_search(db):
     sid = await db.create_source("https://example.com/rss", "Ex", "rss")
@@ -148,13 +177,17 @@ async def test_list_filters_and_sort(db):
     await db.upsert_items(s1, [_item("a1", title="one", published_at=t - 30, tags=["x"]),
                          _item("a2", title="two", published_at=t - 10)])
     await db.upsert_items(s2, [_item("b1", title="three", published_at=t - 20),
-                         _item("b2", title=None or "four")])  # no date
+                         _item("b2", title="four", published_at=None)])  # no date
     lst, total = await db.list_items()
     assert total == 4
-    assert [i["title"] for i in lst] == ["four", "two", "three", "one"]  # nulls last
+    # dated items newest-first; the undated item trails by its added date
+    assert [i["title"] for i in lst] == ["two", "three", "one", "four"]
+    assert lst[0]["published_at"] == pytest.approx(t - 10)
+    assert lst[3]["published_at"] == pytest.approx(t, abs=5)  # first-seen fallback
     lst, total = await db.list_items(sort="old")
-    assert lst[0]["title"] in ("one", "three", "two")  # dated items first, oldest first
-    assert lst[0]["published_at"] == t - 30
+    # dated items oldest-first; the undated item still trails
+    assert [i["title"] for i in lst] == ["one", "three", "two", "four"]
+    assert lst[0]["published_at"] == pytest.approx(t - 30)
     _, total = await db.list_items(category_id=cat["id"])
     assert total == 2
     _, total = await db.list_items(source_id=s2)

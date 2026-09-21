@@ -1,4 +1,5 @@
 """API tests with an in-memory-ish temp DB and mocked refresh (no network)."""
+import asyncio
 import time
 
 import httpx
@@ -7,7 +8,8 @@ import pytest_asyncio
 from fastapi.testclient import TestClient
 
 import api.app as app_module
-from fetcher import Fetcher, _error_text
+from crawler.base import FetchContext
+from fetcher import EventBus, Fetcher, _error_text
 from models.database import Database
 
 
@@ -298,6 +300,31 @@ async def test_fetcher_run_blocking_and_busy(tmp_path, monkeypatch):
         await db.close()
 
 
+def test_event_bus_fanout_and_backpressure():
+    import asyncio
+
+    async def main():
+        bus = EventBus()
+        q1, q2, tiny = bus.subscribe(), bus.subscribe(), bus.subscribe()
+        bus.publish({"type": "source", "n": 1})
+        first = [await asyncio.wait_for(q.get(), 1) for q in (q1, q2)]
+        assert first == [{"type": "source", "n": 1}] * 2
+        # a full subscriber never breaks publishing for the others
+        for i in range(200):
+            bus.publish({"type": "source", "n": i})
+        assert q1.qsize() == q1.maxsize and tiny.qsize() == tiny.maxsize
+        # unsubscribed queues stop receiving
+        bus.unsubscribe(q1)
+        while not q1.empty():
+            await q1.get()
+        bus.publish({"type": "done"})
+        assert q1.empty()
+        bus.unsubscribe(q2)
+        bus.unsubscribe(tiny)
+
+    asyncio.run(main())
+
+
 def test_error_text_walks_cause_chain():
     root = OSError(104, "Connection reset by peer")
     exc = httpx.ConnectError("")
@@ -308,3 +335,79 @@ def test_error_text_walks_cause_chain():
     assert _error_text(ValueError("boom")) == "ValueError: boom"
     # nothing anywhere in the chain: still non-empty
     assert _error_text(httpx.ConnectError("")).startswith("ConnectError:")
+
+
+def test_error_text_includes_http_status_and_response():
+    request = httpx.Request("GET", "https://example.org/feed.xml")
+    response = httpx.Response(404, request=request,
+                              text="<!doctype html>\n  Page Not Found")
+    exc = httpx.HTTPStatusError("Client error '404 Not Found'",
+                                request=request, response=response)
+    text = _error_text(exc)
+    assert text.startswith("HTTP 404")
+    assert "https://example.org/feed.xml" in text
+    assert "response: <!doctype html> Page Not Found" in text
+    # no response body: still a useful, single line
+    request2 = httpx.Request("GET", "https://example.org/feed.xml")
+    response2 = httpx.Response(500, request=request2, text="")
+    text2 = _error_text(httpx.HTTPStatusError("x", request=request2, response=response2))
+    assert text2 == "HTTP 500 Internal Server Error from https://example.org/feed.xml"
+
+
+@pytest.mark.asyncio
+async def test_refresh_upgrades_misrouted_web_plugin(tmp_path, monkeypatch):
+    """Sources stored as the generic web plugin (before a dedicated plugin
+    matched their URL) are switched to the dedicated plugin on refresh."""
+    from crawler.base import FetchResult, ParsedItem
+    from crawler.plugins.rss import RSSPlugin
+
+    db = Database(str(tmp_path / "heal.db"))
+    await db.init()
+    try:
+        sid = await db.create_source("https://www.cbc.ca/webfeed/rss/rss-topstories",
+                                     "CBC", "web")
+        assert (await db.get_source(sid))["plugin"] == "web"
+
+        async def fake_fetch(self, ctx):
+            return FetchResult(items=[ParsedItem(guid="g1", url="https://x/1",
+                                                 title="Top story")],
+                               source_name="CBC News")
+
+        monkeypatch.setattr(RSSPlugin, "fetch", fake_fetch)
+        fetcher = Fetcher(db)
+        src = await db.get_source(sid)
+        async with httpx.AsyncClient() as hc:
+            result = await fetcher._refresh_one(hc, src, asyncio.Semaphore(1))
+        assert result["status"] == "ok"
+        assert result["plugin"] == "rss"
+        assert result["inserted"] == 1
+        assert (await db.get_source(sid))["plugin"] == "rss"
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_refresh_failure_records_http_error(tmp_path, monkeypatch):
+    db = Database(str(tmp_path / "fail.db"))
+    await db.init()
+    try:
+        sid = await db.create_source("https://example.org/feed.xml", "Ex", "rss")
+        src = await db.get_source(sid)
+
+        async def boom(self, url, conditional=False, headers=None):
+            request = httpx.Request("GET", url)
+            response = httpx.Response(500, request=request, text="<html>boom</html>")
+            raise httpx.HTTPStatusError("server error", request=request, response=response)
+
+        monkeypatch.setattr(FetchContext, "get_text", boom)
+        fetcher = Fetcher(db)
+        async with httpx.AsyncClient() as hc:
+            result = await fetcher._refresh_one(hc, src, asyncio.Semaphore(1))
+        assert result["status"] == "error"
+        assert "HTTP 500" in result["error"]
+        assert "response: <html>boom</html>" in result["error"]
+        row = await db.get_source(sid)
+        assert row["last_status"] == "error"
+        assert "HTTP 500" in row["last_error"]
+    finally:
+        await db.close()

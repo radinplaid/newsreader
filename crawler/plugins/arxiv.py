@@ -13,6 +13,7 @@ from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 from crawler import register
 from crawler.base import Plugin, FetchContext, FetchResult, ParsedItem
+from crawler.pool import run_parse
 from crawler.textutil import clean, find_date_in_text, parse_date, soup_from, text_of
 
 _ID_RE = re.compile(r"arxiv\.org/(?:abs|pdf)/([0-9v./-]+)", re.I)
@@ -139,7 +140,7 @@ class ArxivPlugin(Plugin):
             name = self._search_name(url)
         elif "/abs/" in url:
             text = await ctx.get_text(url)
-            paper = parse_abs_page(text or "", url)
+            paper = await run_parse(parse_abs_page, text or "", url)
             items = [paper] if paper else []
             name = "arXiv"
         else:
@@ -172,7 +173,7 @@ class ArxivPlugin(Plugin):
             text = await ctx.get_text(page_url, conditional=(start == 0))
             if text is None:
                 break
-            page_items = parse_search_page(text, page_url)
+            page_items = await run_parse(parse_search_page, text, page_url)
             new = [i for i in page_items if i["guid"] not in seen]
             if not new:
                 break
