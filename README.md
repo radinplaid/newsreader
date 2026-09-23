@@ -251,7 +251,11 @@ works over the API via `GET /api/sources/export` and
 Per-source knobs live in `source.config` (merged with plugin defaults), e.g.
 `{"max_items": 500, "fetch_content": true, "content_fetch_limit": 12}` for web
 sources, `{"fetch_video_dates": true, "date_fetch_limit": 60}` for YouTube,
-`{"max_results": 200}` for arXiv.
+`{"max_results": 200}` for arXiv. Paginated scrapers stop following pages
+once a page reaches items already in the DB (`"stop_on_known": false` opts
+out); YouTube stops its per-video date fetches after
+`"date_fetch_max_errors"` failures per refresh and remembers bot-check /
+members-only failures in `date_fetch_skip` for 3 days.
 
 ## Performance notes
 

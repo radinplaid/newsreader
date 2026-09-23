@@ -93,6 +93,58 @@ async def test_upsert_skips_empty_and_duplicate_guids(db):
 
 
 @pytest.mark.asyncio
+async def test_upsert_skips_new_entry_with_known_url(db):
+    sid = await db.create_source("https://example.com/rss", "Ex", "rss")
+    await db.upsert_items(sid, [_item("g1", url="https://example.com/story")])
+    # same URL under a new guid is the same entry: not added again
+    ins, upd, ids = await db.upsert_items(sid, [_item("g2", url="https://example.com/story")])
+    assert (ins, upd, ids) == (0, 0, [])
+    lst, total = await db.list_items(source_id=sid)
+    assert total == 1 and lst[0]["guid"] == "g1"
+    # a known (source, guid) with that URL still updates in place
+    ins, upd, ids = await db.upsert_items(
+        sid, [_item("g1", url="https://example.com/story", title="Retitled")])
+    assert (ins, upd, ids) == (0, 1, [])
+    lst, _ = await db.list_items(source_id=sid)
+    assert lst[0]["title"] == "Retitled"
+
+
+@pytest.mark.asyncio
+async def test_upsert_dedupes_url_across_sources(db):
+    s1 = await db.create_source("https://example.com/a", "A", "rss")
+    s2 = await db.create_source("https://example.com/b", "B", "rss")
+    await db.upsert_items(s1, [_item("a1", url="https://example.com/story")])
+    ins, upd, ids = await db.upsert_items(s2, [_item("b1", url="https://example.com/story")])
+    assert (ins, upd, ids) == (0, 0, [])
+    _, total = await db.list_items()
+    assert total == 1
+
+
+@pytest.mark.asyncio
+async def test_upsert_dedupes_url_within_batch(db):
+    sid = await db.create_source("https://example.com/rss", "Ex", "rss")
+    items = [_item("g1", url="https://example.com/same"),
+             _item("g2", url="https://example.com/same"),
+             _item("g3", url="https://example.com/other"),
+             _item("g4", url=""),
+             _item("g5", url="")]
+    assert (await db.upsert_items(sid, items))[:2] == (4, 0)
+    lst, total = await db.list_items(source_id=sid)
+    assert {i["guid"] for i in lst} == {"g1", "g3", "g4", "g5"}
+
+
+@pytest.mark.asyncio
+async def test_upsert_update_reserves_url_against_new_guid(db):
+    sid = await db.create_source("https://example.com/rss", "Ex", "rss")
+    await db.upsert_items(sid, [_item("g1", url="https://example.com/story")])
+    items = [_item("g2", url="https://example.com/story"),
+             _item("g1", url="https://example.com/story", title="Updated")]
+    assert (await db.upsert_items(sid, items))[:2] == (0, 1)
+    _, total = await db.list_items(source_id=sid)
+    assert total == 1
+
+
+@pytest.mark.asyncio
 async def test_item_tags_auto_apply_on_upsert(db):
     sid = await db.create_source("https://example.com/rss", "Ex", "rss")
     await db.upsert_items(sid, [_item("g1", tags=["ml", "  safety "])])

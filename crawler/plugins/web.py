@@ -454,7 +454,7 @@ class WebPlugin(Plugin):
 
     def default_config(self) -> dict:
         return {"max_items": 300, "fetch_content": True, "content_fetch_limit": 24,
-                "max_pages": 3}
+                "max_pages": 3, "stop_on_known": True}
 
     async def fetch(self, ctx: FetchContext) -> FetchResult:
         items: list[dict] = []
@@ -471,6 +471,7 @@ class WebPlugin(Plugin):
             next_url: str | None = url
             last_text: str | None = None
             max_pages = int(ctx.config.get("max_pages", 3))
+            stop_on_known = bool(ctx.config.get("stop_on_known", True))
             while next_url and pages < max_pages:
                 text = await ctx.get_text(next_url, conditional=(pages == 0))
                 if text is None:
@@ -492,12 +493,15 @@ class WebPlugin(Plugin):
                 seen_guids = {i["guid"] for i in items}
                 items.extend(i for i in page_items if i["guid"] not in seen_guids)
                 pages += 1
-                if len(page_items) >= 5:
+                # listings are newest-first: a page holding items the DB
+                # already has means the rest of the pagination is older still
+                hit_known = any(i["guid"] in ctx.known_dates for i in page_items)
+                if (stop_on_known and hit_known) or len(page_items) < 5:
+                    next_url = None
+                else:
                     next_url = await run_parse(_find_next_page,
                                                ctx.config.get("next_page_selector"),
                                                text, next_url)
-                else:
-                    next_url = None
             if not items and last_text is not None:
                 # maybe the URL is a single article page
                 article = await run_parse(extract_article, last_text, url)

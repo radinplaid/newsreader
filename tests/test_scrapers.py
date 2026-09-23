@@ -1,10 +1,13 @@
 """Offline parser tests: fixture HTML/XML snippets, no network."""
+import time
+
 import pytest
 import httpx
 
 from crawler import find_plugin
 from crawler.base import FetchContext
-from crawler.plugins.arxiv import parse_abs_page, parse_search_page
+from crawler.plugins import youtube as yt_mod
+from crawler.plugins.arxiv import ArxivPlugin, parse_abs_page, parse_search_page
 from crawler.plugins.rss import _parse_feed
 from crawler.plugins.web import WebPlugin, extract_article, extract_listing
 
@@ -300,11 +303,12 @@ def test_registry_routing():
     assert find_plugin("https://some-blog.example/posts").name == "web"
 
 
-def _mock_ctx(handler, url="https://example.com/x"):
+def _mock_ctx(handler, url="https://example.com/x", known_dates=None, config=None):
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     source = {"id": 0, "url": url, "name": "", "etag": "", "last_modified": "",
               "config": {}}
-    return FetchContext(source=source, client=client, known_dates={}, config={})
+    return FetchContext(source=source, client=client,
+                        known_dates=known_dates or {}, config=config or {})
 
 
 @pytest.mark.asyncio
@@ -368,3 +372,190 @@ async def test_get_text_does_not_retry_http_errors():
         await ctx.get_text("https://example.com/x")
     assert len(calls) == 1  # the server answered: retrying would not help
     await ctx.client.aclose()
+
+
+def _listing_page(names, next_href=None):
+    cards = "".join(
+        f'<div class="card-wrap"><article class="card">'
+        f'<img src="/img/{n}.png">'
+        f'<h3>Post {n.title()}</h3>'
+        f'<div class="card-date">September 2026</div>'
+        f'<a class="stretch" href="/blog/{n}"></a></article></div>'
+        for n in names)
+    nxt = f'<a rel="next" href="{next_href}">Next</a>' if next_href else ""
+    return f'<html><body><main><div class="grid">{cards}</div>{nxt}</main></body></html>'
+
+
+def _paged_handler(page1, page2, fetched):
+    def handler(request):
+        fetched.append(str(request.url))
+        page = request.url.params.get("page")
+        return httpx.Response(200, text=page1 if not page else page2)
+    return handler
+
+
+@pytest.mark.asyncio
+async def test_web_pagination_stops_at_known_items():
+    """A page holding items the DB already has ends pagination: everything
+    deeper is older, while new items on that page are still collected."""
+    fetched = []
+    page1 = _listing_page(["p1", "p2", "p3", "p4", "p5"], "/blog?page=2")
+    page2 = _listing_page(["p6", "p7", "p8", "p9", "p10"], "/blog?page=3")
+    ctx = _mock_ctx(_paged_handler(page1, page2, fetched), url="https://ex.com/blog",
+                    known_dates={"https://ex.com/blog/p5": 1.0},
+                    config={"fetch_content": False})
+    result = await WebPlugin().fetch(ctx)
+    await ctx.client.aclose()
+    assert fetched == ["https://ex.com/blog"]
+    assert {i.guid for i in result.items} == \
+        {f"https://ex.com/blog/p{i}" for i in range(1, 6)}
+
+
+@pytest.mark.asyncio
+async def test_web_pagination_continues_when_all_items_new():
+    fetched = []
+    page1 = _listing_page(["p1", "p2", "p3", "p4", "p5"], "/blog?page=2")
+    page2 = _listing_page(["p6", "p7", "p8", "p9", "p10"])
+    ctx = _mock_ctx(_paged_handler(page1, page2, fetched), url="https://ex.com/blog",
+                    config={"fetch_content": False})
+    result = await WebPlugin().fetch(ctx)
+    await ctx.client.aclose()
+    assert fetched == ["https://ex.com/blog", "https://ex.com/blog?page=2"]
+    assert len(result.items) == 10
+
+
+@pytest.mark.asyncio
+async def test_web_pagination_stop_on_known_can_be_disabled():
+    fetched = []
+    page1 = _listing_page(["p1", "p2", "p3", "p4", "p5"], "/blog?page=2")
+    page2 = _listing_page(["p6", "p7", "p8", "p9", "p10"])
+    ctx = _mock_ctx(_paged_handler(page1, page2, fetched), url="https://ex.com/blog",
+                    known_dates={"https://ex.com/blog/p5": 1.0},
+                    config={"fetch_content": False, "stop_on_known": False})
+    result = await WebPlugin().fetch(ctx)
+    await ctx.client.aclose()
+    assert fetched == ["https://ex.com/blog", "https://ex.com/blog?page=2"]
+    assert len(result.items) == 10
+
+
+@pytest.mark.asyncio
+async def test_arxiv_search_pagination_stops_at_known_items():
+    fetched = []
+
+    def handler(request):
+        fetched.append(str(request.url))
+        start = int(request.url.params.get("start", 0))
+        return httpx.Response(
+            200, text=ARXIV_RESULT.replace("2609.14795", f"2609.0000{start + 1}"))
+
+    url = "https://arxiv.org/search/?query=mt&size=1"
+    ctx = _mock_ctx(handler, url=url, known_dates={"2609.00001": 1.0},
+                    config={"max_results": 2, "page_delay": 0})
+    result = await ArxivPlugin().fetch(ctx)
+    await ctx.client.aclose()
+    assert len(fetched) == 1
+    assert [i.guid for i in result.items] == ["2609.00001"]
+
+
+@pytest.mark.asyncio
+async def test_arxiv_search_pagination_continues_when_all_items_new():
+    fetched = []
+
+    def handler(request):
+        fetched.append(str(request.url))
+        start = int(request.url.params.get("start", 0))
+        return httpx.Response(
+            200, text=ARXIV_RESULT.replace("2609.14795", f"2609.0000{start + 1}"))
+
+    url = "https://arxiv.org/search/?query=mt&size=1"
+    ctx = _mock_ctx(handler, url=url,
+                    config={"max_results": 2, "page_delay": 0})
+    result = await ArxivPlugin().fetch(ctx)
+    await ctx.client.aclose()
+    assert len(fetched) == 2
+    assert [i.guid for i in result.items] == ["2609.00001", "2609.00002"]
+
+
+def test_sticky_failure_detection():
+    assert yt_mod._sticky_failure(Exception(
+        "ERROR: [youtube] x: Sign in to confirm you're not a bot."))
+    assert yt_mod._sticky_failure(Exception(
+        "This video is available to this channel's members on level: X"))
+    assert yt_mod._sticky_failure(Exception(
+        "Join this channel from your computer or mobile app"))
+    assert not yt_mod._sticky_failure(Exception("HTTP Error 500: Internal Server Error"))
+    assert not yt_mod._sticky_failure(TimeoutError("timed out"))
+
+
+def _yt_playlist(entries):
+    return {"_type": "playlist", "title": "Chan",
+            "entries": [{"id": v, "title": f"Video {v}",
+                         "url": f"https://www.youtube.com/watch?v={v}"}
+                        for v in entries]}
+
+
+@pytest.mark.asyncio
+async def test_youtube_date_fetch_bails_on_error_streak(monkeypatch):
+    """Once several per-video extractions fail (bot check), the run stops
+    hammering YouTube and remembers the failures for later refreshes."""
+    vids = [f"v{i}" for i in range(20)]
+    calls = []
+
+    def fake_extract(url, opts):
+        calls.append(opts)
+        if opts.get("extract_flat"):
+            assert opts["playlistend"] == 20
+            return _yt_playlist(vids)
+        raise Exception("ERROR: [youtube] x: Sign in to confirm you're not a bot.")
+
+    monkeypatch.setattr(yt_mod, "_extract", fake_extract)
+    ctx = _mock_ctx(lambda r: httpx.Response(200),
+                    url="https://www.youtube.com/@chan/videos",
+                    config={"max_items": 20, "date_fetch_max_errors": 2})
+    result = await yt_mod.YouTubePlugin().fetch(ctx)
+    await ctx.client.aclose()
+    full = [c for c in calls if not c.get("extract_flat")]
+    assert len(calls) == 1 + len(full)
+    assert 0 < len(full) < 20
+    skip = result.config_updates["date_fetch_skip"]
+    assert set(skip) == set(vids[:len(full)])
+
+
+@pytest.mark.asyncio
+async def test_youtube_date_fetch_marks_sticky_failures(monkeypatch):
+    def fake_extract(url, opts):
+        if opts.get("extract_flat"):
+            return _yt_playlist(["v1", "v2", "v3"])
+        raise Exception("Join this channel from your computer or mobile app")
+
+    monkeypatch.setattr(yt_mod, "_extract", fake_extract)
+    ctx = _mock_ctx(lambda r: httpx.Response(200),
+                    url="https://www.youtube.com/@chan/videos",
+                    config={"date_fetch_max_errors": 10})
+    result = await yt_mod.YouTubePlugin().fetch(ctx)
+    await ctx.client.aclose()
+    assert set(result.config_updates["date_fetch_skip"]) == {"v1", "v2", "v3"}
+
+
+@pytest.mark.asyncio
+async def test_youtube_date_fetch_skips_remembered_failures(monkeypatch):
+    fetched = []
+
+    def fake_extract(url, opts):
+        if opts.get("extract_flat"):
+            return _yt_playlist(["v1", "v2", "v3"])
+        fetched.append(url)
+        return {"timestamp": 1758400000, "description": "desc",
+                "uploader": "Chan", "thumbnail": "https://i.ytimg.com/x.jpg"}
+
+    monkeypatch.setattr(yt_mod, "_extract", fake_extract)
+    ctx = _mock_ctx(lambda r: httpx.Response(200),
+                    url="https://www.youtube.com/@chan/videos",
+                    config={"date_fetch_skip": {"v1": time.time()}})
+    result = await yt_mod.YouTubePlugin().fetch(ctx)
+    await ctx.client.aclose()
+    assert [u.rsplit("=", 1)[1] for u in fetched] == ["v2", "v3"]
+    assert result.config_updates == {}
+    by_guid = {i.guid: i for i in result.items}
+    assert by_guid["v2"].published_at is not None
+    assert by_guid["v1"].published_at is None

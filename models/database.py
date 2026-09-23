@@ -383,25 +383,44 @@ class Database:
             return {r["guid"]: r["published_at"] for r in rows}
 
     async def upsert_items(self, source_id: int, items: list[dict]) -> tuple[int, int, list[int]]:
-        """Insert/update parsed items. Returns (inserted, updated, inserted_ids)."""
+        """Insert/update parsed items. Returns (inserted, updated, inserted_ids).
+
+        The URL identifies an entry: a new row is inserted only when no item
+        with that URL has been added before (to any source), so the same
+        story syndicated through several feeds shows up once. Items whose
+        (source_id, guid) is already stored are updated in place as before;
+        items with an empty URL cannot be matched and are kept.
+        """
         if not items:
             return (0, 0, [])
         existing = await self.known_dates(source_id)
         now = time.time()
         max_date = now + _FUTURE_DATE_TOLERANCE
-        rows = []
-        upd_rows = []
+        parsed = []
         seen = set()
         for it in items:
             guid = str(it.get("guid") or "").strip()
             if not guid or guid in seen:
                 continue
             seen.add(guid)
+            parsed.append((guid, str(it.get("url") or "").strip(), it))
+        # URLs kept alive by in-place updates are reserved: a new guid
+        # claiming one of them is the same entry again.
+        reserved = {u for g, u, _ in parsed if u and g in existing}
+        rows = []
+        upd_rows = []
+        new_urls = set()
+        for guid, url, it in parsed:
+            if guid not in existing:
+                if url and (url in reserved or url in new_urls):
+                    continue
+                if url:
+                    new_urls.add(url)
             published_at = it.get("published_at")
             if published_at is not None and published_at > max_date:
                 published_at = None  # future date: CMS timezone bug or scheduled post
             rows.append((
-                source_id, guid, it.get("url") or "", it.get("title") or "",
+                source_id, guid, url, it.get("title") or "",
                 it.get("summary") or "", it.get("content") or "", it.get("author") or "",
                 published_at, it.get("image_url") or "",
                 json.dumps(it.get("extra") or {}, ensure_ascii=False), now, now,
@@ -411,6 +430,18 @@ class Database:
         inserted = updated = 0
         if rows:
             async with self.write() as conn:
+                taken = set()
+                url_list = sorted(new_urls)
+                for i in range(0, len(url_list), 500):
+                    chunk = url_list[i:i + 500]
+                    qmarks = ",".join("?" * len(chunk))
+                    async with conn.execute(
+                        f"SELECT DISTINCT url FROM items WHERE url IN ({qmarks})", chunk
+                    ) as cur:
+                        taken.update(r["url"] for r in await cur.fetchall())
+                if taken:
+                    rows = [r for r in rows
+                            if r[1] in existing or r[2] not in taken]
                 await conn.executemany(
                     """
                     INSERT INTO items (source_id, guid, url, title, summary, content, author,

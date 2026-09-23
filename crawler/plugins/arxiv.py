@@ -131,7 +131,7 @@ class ArxivPlugin(Plugin):
     priority = 25
 
     def default_config(self) -> dict:
-        return {"max_results": 100, "page_delay": 3.0}
+        return {"max_results": 100, "page_delay": 3.0, "stop_on_known": True}
 
     async def fetch(self, ctx: FetchContext) -> FetchResult:
         url = ctx.source["url"]
@@ -159,6 +159,7 @@ class ArxivPlugin(Plugin):
     async def _fetch_search(self, ctx: FetchContext, url: str) -> list[dict]:
         max_results = int(ctx.config.get("max_results", 100))
         delay = float(ctx.config.get("page_delay", 3.0))
+        stop_on_known = bool(ctx.config.get("stop_on_known", True))
         parts = urlparse(url)
         qs = parse_qs(parts.query)
         size = int((qs.get("size") or ["50"])[0])
@@ -181,6 +182,10 @@ class ArxivPlugin(Plugin):
                 seen.add(i["guid"])
             items.extend(new)
             if len(page_items) < size:
+                break
+            # results are newest-first: once a page reaches papers the DB
+            # already has, deeper pages are older and already stored
+            if stop_on_known and any(i["guid"] in ctx.known_dates for i in page_items):
                 break
             start += size
             if start < max_results:
