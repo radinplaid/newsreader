@@ -188,6 +188,7 @@ class Fetcher:
         result = {
             "source_id": src["id"], "source": name, "url": src["url"],
             "plugin": src["plugin"] or "", "inserted": 0, "updated": 0,
+            "inserted_ids": [],
             "status": "ok", "error": "", "requests": 0, "duration": 0.0,
         }
         async with sem:
@@ -216,7 +217,11 @@ class Fetcher:
                 )
                 fetched = await plugin.fetch(ctx)
                 rows = [item.to_row() for item in fetched.items]
-                result["inserted"], result["updated"] = await self.db.upsert_items(src["id"], rows)
+                inserted, updated, new_ids = await self.db.upsert_items(src["id"], rows)
+                result["inserted"], result["updated"] = inserted, updated
+                # capped list of fresh row ids: lets the web client surface
+                # "N new" and prepend them without reloading the whole list
+                result["inserted_ids"] = new_ids[:500]
                 if fetched.source_name and not (src.get("name") or ""):
                     result["source_name"] = fetched.source_name
                     await self.db.update_source(src["id"], name=fetched.source_name)

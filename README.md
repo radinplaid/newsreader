@@ -41,9 +41,36 @@ serverless HTML5 web client (plain static files — no build step, no framework)
   (clicking the source itself still shows its items).
 * **Categories of sources** — add/remove categories, assign sources to them;
   items inherit their category through their source.
-* **Responsive web viewer** — dark/light theme, card grid on desktop, single
-  column on mobile, off-canvas sidebar, infinite scroll, detail drawer with
-  an inline tag editor.
+* **Reader-first web UI** — three-pane app shell (sidebar · article list ·
+  reading pane) so opening an article never loses your place in the list;
+  below ~1180 px the reader slides in over the list and below ~900 px the
+  sidebar becomes off-canvas. Dark/light theme, comfortable/compact list
+  density, infinite scroll, search-term highlighting, per-article tag editor,
+  and prefetching of the next/previous article so navigation is instant.
+  YouTube items (and YouTube links inside article bodies) render as
+  click-to-load facades — thumbnail + play button, with a youtube-nocookie
+  iframe appearing only on tap.
+* **Unread tracking** — server-side read state (`items.read_at`) with unread
+  badges per source/category, an Unread view, per-row read toggles and
+  bulk “Mark read” over the current filter. Existing articles are migrated
+  as read, so upgrading never presents a backlog. Read state follows the
+  database, not the browser.
+* **Safe triage** — star, dismiss and read are one tap (or a swipe on list
+  rows: left dismisses, right stars). Dismissal is undoable via a toast
+  (`DELETE /api/items/{id}/dismiss`), and refreshes never yank the list out
+  from under you: fresh arrivals surface as a “N new” pill that prepends
+  them in place.
+* **Date scoping** — “Today / 7 days / 30 days” chips narrow any view (and
+  compose with search, tags and sources); “All time” lifts the window again.
+  A firehose like arXiv + the Guardian stays readable on a daily cadence.
+* **Keyboard-driven** — `j`/`k` (or `↑`/`↓`/`←`/`→`) walk the list, `Enter`/`o`
+  opens the original, `s` stars, `u` toggles read, `d` dismisses (undoable),
+  `c` copies the link, `/` searches, `r` refreshes, `t` toggles the theme,
+  `?` shows the shortcut sheet. On touch screens the same walk is a
+  left/right swipe on the open article, and list rows swipe left/right to
+  dismiss/star (edge swipes stay with the browser's back gesture). Filters
+  and the open article are reflected in the URL hash (shareable,
+  back/forward friendly).
 
 ## Quickstart
 
@@ -159,15 +186,23 @@ triggers. Deleting a source or item cascades cleanly.
 ## API
 
 ```
-GET    /api/health                     counts
-GET    /api/items?q&category_id&source_id&tag&starred&sort=new|old|rank&limit&offset
+GET    /api/health                     counts (incl. unread_items)
+GET    /api/items?q&category_id&source_id&tag&starred&unread&since&until&ids
+                                        &sort=new|old|rank&limit&offset
+                                        since/until: epoch seconds or ISO date
+                                        (a date-only until covers that whole day);
+                                        ids: comma-separated explicit set
 GET    /api/items/{id}
 PUT    /api/items/{id}/tags            {"tags": [...]}   replace
 POST   /api/items/{id}/tags            {"tags": [...]}   add
 DELETE /api/items/{id}/tags/{tag}
 POST   /api/items/{id}/star            star an article
 DELETE /api/items/{id}/star            unstar
+POST   /api/items/{id}/read            mark read (stamps read_at)
+DELETE /api/items/{id}/read            mark unread
+POST   /api/items/read-all             {"read": true, "ids"?|filter?} bulk mark
 POST   /api/items/{id}/dismiss         hide the article everywhere
+DELETE /api/items/{id}/dismiss         undo a dismissal
 GET    /api/tags
 GET    /api/sources                    (also lists available plugins)
 POST   /api/sources                    {"url", "name"?, "category_id"?, "category_name"?}
@@ -181,6 +216,7 @@ PATCH  /api/categories/{id}            {"name"}
 DELETE /api/categories/{id}
 POST   /api/refresh                    {"source_id"?}  — starts a background run
 GET    /api/refresh/status             progress + per-source results
+                                        (each result carries inserted_ids)
 GET    /api/events                     server-sent events: refresh start/progress/
                                        completion + per-source failures (SSE)
 ```

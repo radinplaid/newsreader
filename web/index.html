@@ -1,109 +1,170 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="dark light">
 <title>Newsreader</title>
 <link rel="stylesheet" href="style.css">
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📰</text></svg>">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%234c7dff'/%3E%3Cpath d='M8 9h11a1 1 0 0 1 1 1v12H9a1 1 0 0 1-1-1V9z' fill='%23fff'/%3E%3Cpath d='M20 12h3a1 1 0 0 1 1 1v8a2 2 0 0 1-2 2h-2v-11z' fill='%23dbe6ff'/%3E%3Cpath d='M11 12h6M11 15h6M11 18h4' stroke='%234c7dff' stroke-width='1.6' stroke-linecap='round'/%3E%3C/svg%3E">
 </head>
 <body>
 
-<div id="refreshBar" class="refresh-bar hidden"><div id="refreshBarFill"></div></div>
+<div id="refreshBar" class="refresh-bar hidden"><div id="refreshBarFill" class="refresh-bar-fill"></div></div>
 
 <header class="topbar">
-  <button id="menuBtn" class="icon-btn" aria-label="Toggle sidebar">☰</button>
-  <a class="brand" href="#/">📰 <span>Newsreader</span></a>
+  <button id="menuBtn" class="icon-btn menu-btn" data-icon="menu" aria-label="Toggle sidebar"></button>
+  <a class="brand" href="#/" aria-label="Newsreader home">
+    <span class="brand-mark" data-icon="paper"></span>
+    <span class="brand-name">Newsreader</span>
+  </a>
   <div class="searchwrap">
-    <input id="search" type="search" placeholder="Search articles…  (title, summary, full text)"
-           autocomplete="off" spellcheck="false">
+    <span class="search-icon" data-icon="search"></span>
+    <input id="search" type="search" placeholder="Search title, summary and full text…"
+           autocomplete="off" spellcheck="false" aria-label="Search articles">
+    <button id="searchClear" class="search-clear hidden" data-icon="x" aria-label="Clear search"></button>
     <kbd id="searchShortcut">/</kbd>
   </div>
-  <select id="sortSel" class="select" title="Sort order">
-    <option value="new">Newest first</option>
-    <option value="old">Oldest first</option>
-    <option value="rank">Relevance</option>
-  </select>
-  <button id="themeBtn" class="icon-btn" aria-label="Toggle theme">☾</button>
-  <button id="addBtn" class="btn primary" title="Add a news source">+ Source</button>
+  <div class="topbar-actions">
+    <select id="sortSel" class="select" title="Sort order" aria-label="Sort order">
+      <option value="new">Newest first</option>
+      <option value="old">Oldest first</option>
+      <option value="rank">Relevance</option>
+    </select>
+    <button id="themeBtn" class="icon-btn" aria-label="Toggle theme" title="Toggle theme"></button>
+    <button id="helpBtn" class="icon-btn" data-icon="help" aria-label="Keyboard shortcuts" title="Keyboard shortcuts (?)"></button>
+    <button id="addBtn" class="btn primary add-btn" title="Add a news source"><span data-icon="plus"></span><span class="btn-label">Source</span></button>
+  </div>
 </header>
 
-<div class="layout">
-  <aside id="sidebar" class="sidebar">
+<div class="shell">
+  <aside id="sidebar" class="sidebar" aria-label="Library">
     <div class="side-scroll">
-      <section>
-        <div class="side-head"><h2>Categories</h2>
-          <button class="mini-btn" id="addCatBtn" title="Add category">+</button>
+      <nav class="side-block" aria-label="Views">
+        <ul id="navList" class="side-list"></ul>
+      </nav>
+      <section class="side-block">
+        <div class="side-head">
+          <h2>Categories</h2>
+          <button class="mini-btn" id="addCatBtn" data-icon="plus" title="Add category" aria-label="Add category"></button>
         </div>
         <ul id="catList" class="side-list"></ul>
       </section>
-      <section>
+      <section class="side-block">
         <div class="side-head"><h2>Sources</h2></div>
         <ul id="srcList" class="side-list"></ul>
       </section>
-      <section>
+      <section class="side-block">
         <div class="side-head"><h2>Tags</h2></div>
         <div id="tagFilterWrap" class="tag-filter hidden">
-          <input id="tagFilter" type="search" placeholder="Find a tag…" autocomplete="off">
+          <input id="tagFilter" type="search" placeholder="Filter tags…" autocomplete="off" aria-label="Filter tags">
         </div>
         <div id="tagCloud" class="tag-cloud"></div>
       </section>
     </div>
     <footer class="side-foot">
-      <span id="dbStats"></span>
-      <span id="refreshStatus" class="refresh-status hidden"></span>
-      <button id="refreshBtn" class="btn"><span id="refreshIcon">⟳</span> Refresh all</button>
-      <button id="exportBtn" class="btn" title="Download all sources (no articles) as JSON">⇩ Export</button>
-      <button id="importBtn" class="btn" title="Import sources from an exported JSON file">⇧ Import</button>
-      <input id="importFile" type="file" accept="application/json,.json" class="hidden">
+      <div class="side-stats">
+        <span id="dbStats"></span>
+        <span id="refreshStatus" class="refresh-status hidden"></span>
+      </div>
+      <button id="refreshBtn" class="btn primary block">
+        <span id="refreshIcon" class="icon-slot" data-icon="refresh"></span> Refresh all
+      </button>
+      <div class="side-foot-row">
+        <button id="exportBtn" class="btn ghost grow" title="Download all sources (no articles) as JSON"><span data-icon="download"></span> Export</button>
+        <button id="importBtn" class="btn ghost grow" title="Import sources from an exported JSON file"><span data-icon="upload"></span> Import</button>
+        <input id="importFile" type="file" accept="application/json,.json" class="hidden" tabindex="-1">
+      </div>
     </footer>
   </aside>
   <div id="scrim" class="scrim"></div>
 
-  <main class="main">
-    <div class="toolbar">
-      <div id="filterChips" class="chips"></div>
+  <main class="list-pane" id="listPane" aria-label="Articles">
+    <div class="list-sticky">
+      <div class="list-head">
+        <div class="list-head-text">
+          <h1 id="listTitle">All articles</h1>
+          <p id="listCount" class="list-count"></p>
+        </div>
+        <div class="list-tools">
+          <button id="markReadBtn" class="btn ghost" title="Mark visible articles as read"><span data-icon="checks"></span><span class="btn-label">Mark read</span></button>
+          <button id="densityBtn" class="icon-btn" title="Toggle list density" aria-label="Toggle list density"></button>
+        </div>
+      </div>
+      <div class="toolbar">
+        <div id="rangeChips" class="chips range-chips">
+          <button type="button" class="chip" data-range="today">Today</button>
+          <button type="button" class="chip" data-range="7d">7 days</button>
+          <button type="button" class="chip" data-range="30d">30 days</button>
+          <button type="button" class="chip" data-range="">All time</button>
+        </div>
+        <div id="filterChips" class="chips"></div>
+      </div>
+      <button id="newPill" class="new-pill hidden" type="button"></button>
     </div>
     <div id="itemList" class="items"></div>
     <div id="sentinel" class="sentinel"></div>
-    <div id="endNote" class="endnote hidden">No more items.</div>
+    <div id="endNote" class="endnote hidden">That’s everything.</div>
   </main>
+
+  <section class="reader" id="reader" aria-label="Reader">
+    <div class="reader-empty" id="readerEmpty">
+      <div class="reader-empty-art" data-icon="paper"></div>
+      <h2>Nothing open</h2>
+      <p>Pick a story from the list to read it here — the list keeps your place.</p>
+      <dl class="kbd-hints">
+        <div><dt><kbd>j</kbd> <kbd>k</kbd></dt><dd>next / previous</dd></div>
+        <div><dt><kbd>↵</kbd></dt><dd>open original</dd></div>
+        <div><dt><kbd>s</kbd></dt><dd>star</dd></div>
+        <div><dt><kbd>u</kbd></dt><dd>toggle read</dd></div>
+        <div><dt><kbd>d</kbd></dt><dd>dismiss</dd></div>
+        <div><dt><kbd>c</kbd></dt><dd>copy link</dd></div>
+        <div><dt><kbd>?</kbd></dt><dd>all shortcuts</dd></div>
+      </dl>
+      <p class="swipe-hint">On a touch screen, swipe left / right to move between articles.</p>
+    </div>
+    <article class="reader-body hidden" id="readerBody" aria-live="polite">
+      <header class="reader-bar">
+        <button id="readerBack" class="icon-btn back-btn" data-icon="back" aria-label="Back to list"></button>
+        <div class="reader-actions">
+          <button id="readerStar" class="btn ghost"></button>
+          <button id="readerCopy" class="btn ghost"></button>
+          <button id="readerDismiss" class="btn ghost"></button>
+          <a id="readerOpen" class="btn primary" href="#" target="_blank" rel="noopener"></a>
+        </div>
+      </header>
+      <div class="reader-inner" id="readerInner"></div>
+    </article>
+  </section>
 </div>
 
-<!-- item detail drawer -->
-<div id="detail" class="detail" aria-hidden="true">
-  <div class="detail-inner" id="detailInner"></div>
-  <button id="detailClose" class="icon-btn detail-close" aria-label="Close">✕</button>
-</div>
-
-<!-- add source modal -->
+<!-- add source dialog -->
 <dialog id="addDialog" class="modal">
   <form id="addForm" method="dialog">
     <h3>Add news source</h3>
     <label>URL
-      <input name="url" type="url" required placeholder="https://example.com/blog"
-             autocomplete="off">
+      <input name="url" type="url" required placeholder="https://example.com/blog" autocomplete="off">
     </label>
-    <p class="hint" id="pluginHint">Supported: RSS/Atom feeds, YouTube playlists &amp; channels,
-       arXiv searches, and generic blog/news listing pages.</p>
+    <p class="hint" id="pluginHint">RSS/Atom feeds, YouTube playlists &amp; channels, arXiv searches, and plain blog or news listing pages all work.</p>
     <label>Name <span class="opt">(optional)</span>
-      <input name="name" type="text" placeholder="My blog">
+      <input name="name" type="text" placeholder="My blog" autocomplete="off">
     </label>
-    <label>Category
-      <select name="category_id" id="addCatSel"></select>
-    </label>
-    <label>Or new category <span class="opt">(optional)</span>
-      <input name="category_name" type="text" placeholder="Machine Learning">
-    </label>
+    <div class="form-grid">
+      <label>Category
+        <select name="category_id" id="addCatSel"></select>
+      </label>
+      <label>New category <span class="opt">(optional)</span>
+        <input name="category_name" type="text" placeholder="Machine Learning" autocomplete="off">
+      </label>
+    </div>
     <div class="modal-actions">
-      <button type="button" class="btn" id="addCancel">Cancel</button>
+      <button type="button" class="btn ghost" id="addCancel">Cancel</button>
       <button type="submit" class="btn primary">Add source</button>
     </div>
   </form>
 </dialog>
 
-<!-- edit source modal -->
+<!-- edit source dialog -->
 <dialog id="editDialog" class="modal">
   <form id="editForm" novalidate>
     <h3>Edit source</h3>
@@ -114,27 +175,69 @@
       <input name="url" type="url" required autocomplete="off">
     </label>
     <p class="hint" id="editHint"></p>
-    <label>Category
-      <select name="category_id" id="editCatSel"></select>
-    </label>
-    <label>Or move to new category <span class="opt">(optional)</span>
-      <input name="category_name" type="text" placeholder="New category" autocomplete="off">
-    </label>
+    <div class="form-grid">
+      <label>Category
+        <select name="category_id" id="editCatSel"></select>
+      </label>
+      <label>Move to new category <span class="opt">(optional)</span>
+        <input name="category_name" type="text" placeholder="New category" autocomplete="off">
+      </label>
+    </div>
     <label class="check">
       <input name="enabled" type="checkbox"> Enabled (included in “Refresh all”)
     </label>
+    <label class="check">
+      <input name="hidden" type="checkbox"> Show articles in the combined feed
+    </label>
     <label>Advanced options <span class="opt">(JSON, plugin-specific)</span>
-      <textarea name="config" rows="4" spellcheck="false"
-        placeholder='{"max_items": 100}'></textarea>
+      <textarea name="config" rows="4" spellcheck="false" placeholder='{"max_items": 100}'></textarea>
     </label>
     <div class="modal-actions space-between">
       <button type="button" class="btn danger" id="editDelete">Delete source…</button>
       <span class="modal-actions">
-        <button type="button" class="btn" id="editCancel">Cancel</button>
+        <button type="button" class="btn ghost" id="editCancel">Cancel</button>
         <button type="submit" class="btn primary">Save</button>
       </span>
     </div>
   </form>
+</dialog>
+
+<!-- keyboard shortcuts dialog -->
+<dialog id="helpDialog" class="modal help-modal">
+  <h3>Keyboard shortcuts</h3>
+  <div class="help-grid">
+    <div class="help-group">
+      <h4>Navigate</h4>
+      <dl>
+        <div><dt><kbd>j</kbd> <kbd>↓</kbd> <kbd>→</kbd></dt><dd>Next article</dd></div>
+        <div><dt><kbd>k</kbd> <kbd>↑</kbd> <kbd>←</kbd></dt><dd>Previous article</dd></div>
+        <div><dt><kbd>Enter</kbd> / <kbd>o</kbd></dt><dd>Open original</dd></div>
+        <div><dt><kbd>Esc</kbd></dt><dd>Back to list / clear search</dd></div>
+      </dl>
+    </div>
+    <div class="help-group">
+      <h4>Article</h4>
+      <dl>
+        <div><dt><kbd>s</kbd></dt><dd>Star / unstar</dd></div>
+        <div><dt><kbd>u</kbd></dt><dd>Toggle read</dd></div>
+        <div><dt><kbd>d</kbd></dt><dd>Dismiss (undoable)</dd></div>
+        <div><dt><kbd>c</kbd></dt><dd>Copy link</dd></div>
+      </dl>
+    </div>
+    <div class="help-group">
+      <h4>Global</h4>
+      <dl>
+        <div><dt><kbd>/</kbd></dt><dd>Focus search</dd></div>
+        <div><dt><kbd>r</kbd></dt><dd>Refresh all sources</dd></div>
+        <div><dt><kbd>t</kbd></dt><dd>Toggle theme</dd></div>
+        <div><dt><kbd>?</kbd></dt><dd>This dialog</dd></div>
+      </dl>
+    </div>
+  </div>
+  <p class="help-sweep">Touch screens: swipe the article left / right for next / previous; swipe a list row left / right to dismiss / star.</p>
+  <div class="modal-actions">
+    <button type="button" class="btn primary" id="helpClose">Got it</button>
+  </div>
 </dialog>
 
 <!-- persistent source-failure notes (dismissed manually) -->
@@ -145,7 +248,7 @@
   </div>
 </div>
 
-<div id="toast" class="toast" role="status"></div>
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
 
 <script src="purify.min.js"></script>
 <script src="app.js"></script>

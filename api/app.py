@@ -87,6 +87,19 @@ class TagsIn(BaseModel):
     tags: list[str]
 
 
+class ReadAllIn(BaseModel):
+    """Bulk read marking: explicit ids and/or a filter over the corpus."""
+    read: bool = True
+    ids: list[int] | None = None
+    q: str | None = None
+    source_id: int | None = None
+    category_id: int | None = None
+    tag: str | None = None
+    starred: bool = False
+    since: float | None = None
+    until: float | None = None
+
+
 class RefreshIn(BaseModel):
     source_id: int | None = None
     force: bool = False  # bypass the NR_MIN_REFRESH_MINUTES throttle
@@ -128,19 +141,65 @@ async def health(db: Database = Depends(get_db)):
 
 
 # ----------------------------------------------------------------- items
+def _parse_ts(value: str | float | None, *, end: bool = False) -> float | None:
+    """Parse a filter timestamp: epoch seconds or ISO date.
+
+    A date-only `until` is exclusive-by-conversion: it becomes the start of
+    the next day so the named day is fully included in results.
+    """
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        pass
+    from datetime import datetime, timedelta, timezone
+    text = str(value).strip()
+    try:
+        if len(text) == 10:                      # YYYY-MM-DD
+            dt = datetime.strptime(text, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            if end:
+                dt += timedelta(days=1)
+            return dt.timestamp()
+        return datetime.fromisoformat(text).timestamp()
+    except ValueError:
+        raise HTTPException(422, f"invalid timestamp: {value!r}")
+
+
 @app.get("/api/items")
 async def list_items(q: str | None = None, source_id: int | None = None,
                category_id: int | None = None, tag: str | None = None,
-               starred: bool = False,
+               starred: bool = False, unread: bool = False,
+               since: str | float | None = None, until: str | float | None = None,
+               ids: str | None = None,
                sort: str = Query("new", pattern="^(new|old|rank)$"),
                limit: int = Query(50, ge=1, le=200),
                offset: int = Query(0, ge=0),
                db: Database = Depends(get_db)):
+    id_list = None
+    if ids:
+        try:
+            id_list = [int(x) for x in ids.split(",") if x.strip()]
+        except ValueError:
+            raise HTTPException(422, "ids must be a comma-separated list of integers")
     items, total = await db.list_items(
         q=q, source_id=source_id, category_id=category_id, tag=tag,
-        starred=starred, sort=sort, limit=limit, offset=offset,
+        starred=starred, unread=unread,
+        since=_parse_ts(since), until=_parse_ts(until, end=True),
+        ids=id_list, sort=sort, limit=limit, offset=offset,
     )
     return {"items": items, "total": total, "offset": offset, "limit": limit}
+
+
+@app.post("/api/items/read-all")
+async def mark_read_all(body: ReadAllIn, db: Database = Depends(get_db)):
+    """Bulk mark read/unread over explicit ids and/or a filter."""
+    updated = await db.mark_items_read(
+        read=body.read, ids=body.ids, q=body.q, source_id=body.source_id,
+        category_id=body.category_id, tag=body.tag, starred=body.starred,
+        since=body.since, until=body.until,
+    )
+    return {"ok": True, "updated": updated}
 
 
 @app.get("/api/items/{item_id}")
@@ -149,6 +208,22 @@ async def get_item(item_id: int, db: Database = Depends(get_db)):
     if item is None:
         raise HTTPException(404, "item not found")
     return item
+
+
+@app.post("/api/items/{item_id}/read")
+async def mark_item_read(item_id: int, db: Database = Depends(get_db)):
+    if await db.get_item(item_id) is None:
+        raise HTTPException(404, "item not found")
+    await db.set_item_read(item_id, True)
+    return {"read": True}
+
+
+@app.delete("/api/items/{item_id}/read")
+async def mark_item_unread(item_id: int, db: Database = Depends(get_db)):
+    if await db.get_item(item_id) is None:
+        raise HTTPException(404, "item not found")
+    await db.set_item_read(item_id, False)
+    return {"read": False}
 
 
 @app.post("/api/items/{item_id}/tags")
@@ -191,6 +266,14 @@ async def dismiss_item(item_id: int, db: Database = Depends(get_db)):
     if not await db.set_dismissed(item_id, True):
         raise HTTPException(404, "item not found")
     return {"dismissed": True}
+
+
+@app.delete("/api/items/{item_id}/dismiss")
+async def undismiss_item(item_id: int, db: Database = Depends(get_db)):
+    """Undo a dismissal — the item reappears in lists, search and counts."""
+    if not await db.set_dismissed(item_id, False):
+        raise HTTPException(404, "item not found")
+    return {"dismissed": False}
 
 
 @app.get("/api/tags")

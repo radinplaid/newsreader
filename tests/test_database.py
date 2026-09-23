@@ -69,9 +69,9 @@ async def test_upsert_counts_and_merge(db):
     now = time.time()
     items = [_item("g1", title="First", published_at=now - 10, tags=["tag1"]),
              _item("g2", title="Second", published_at=now - 20)]
-    assert await db.upsert_items(sid, items) == (2, 0)
+    assert (await db.upsert_items(sid, items))[:2] == (2, 0)
     # same guids again: updated, not duplicated
-    assert await db.upsert_items(sid, items) == (0, 2)
+    assert (await db.upsert_items(sid, items))[:2] == (0, 2)
     # longer content should win on update
     items2 = [_item("g1", title="First", content="longer content than before")]
     await db.upsert_items(sid, items2)
@@ -89,7 +89,7 @@ async def test_upsert_counts_and_merge(db):
 async def test_upsert_skips_empty_and_duplicate_guids(db):
     sid = await db.create_source("https://example.com/rss", "Ex", "rss")
     items = [_item("g1"), _item("g1"), _item(""), _item("  ")]
-    assert await db.upsert_items(sid, items) == (1, 0)
+    assert (await db.upsert_items(sid, items))[:2] == (1, 0)
 
 
 @pytest.mark.asyncio
@@ -345,3 +345,137 @@ async def test_hidden_sources(db):
     assert (await db.list_items())[1] == 3
     assert (await db.list_items(starred=True))[1] == 1
     assert (await db.counts())["starred_items"] == 1
+
+
+@pytest.mark.asyncio
+async def test_upsert_returns_inserted_ids(db):
+    sid = await db.create_source("https://example.com/rss", "Ex", "rss")
+    ins, upd, ids = await db.upsert_items(sid, [_item("g1"), _item("g2")])
+    assert (ins, upd) == (2, 0) and len(ids) == 2
+    # re-upsert: no new ids
+    ins, upd, ids2 = await db.upsert_items(sid, [_item("g1"), _item("g2")])
+    assert (ins, upd, ids2) == (0, 2, [])
+    # a third guid reports only its own fresh id
+    ins, upd, ids3 = await db.upsert_items(sid, [_item("g1"), _item("g3")])
+    assert (ins, upd) == (1, 1) and len(ids3) == 1
+    assert ids3[0] not in ids
+
+
+@pytest.mark.asyncio
+async def test_read_state_and_unread_filter(db):
+    sid = await db.create_source("https://example.com/rss", "Ex", "rss")
+    await db.upsert_items(sid, [_item("g1", published_at=time.time() - 10),
+                                _item("g2", published_at=time.time() - 20)])
+    # fresh items arrive unread
+    _, total = await db.list_items(unread=True)
+    assert total == 2
+    assert (await db.counts())["unread_items"] == 2
+    g1 = (await db.list_items())[0][0]  # newest first: g1
+
+    assert g1["read_at"] is None
+    assert await db.set_item_read(g1["id"], True) is True
+    got = await db.get_item(g1["id"])
+    assert got["read_at"] is not None
+    lst, total = await db.list_items(unread=True)
+    assert total == 1 and lst[0]["guid"] == "g2"
+    assert (await db.counts())["unread_items"] == 1
+
+    # and back to unread
+    assert await db.set_item_read(g1["id"], False) is True
+    assert (await db.get_item(g1["id"]))["read_at"] is None
+    assert (await db.list_items(unread=True))[1] == 2
+    assert await db.set_item_read(424242, True) is False
+
+
+@pytest.mark.asyncio
+async def test_mark_items_read_bulk(db):
+    cat = await db.create_category("News")
+    s1 = await db.create_source("https://a.example/rss", "A", "rss", cat["id"])
+    s2 = await db.create_source("https://b.example/rss", "B", "rss", cat["id"])
+    await db.upsert_items(s1, [_item("a1", tags=["x"]), _item("a2", tags=["y"])])
+    await db.upsert_items(s2, [_item("b1", tags=["x"])])
+
+    assert await db.mark_items_read(source_id=s1) == 2
+    assert (await db.list_items(unread=True))[1] == 1          # b1 left
+    assert (await db.get_source(s1))["unread_count"] == 0
+    assert (await db.get_source(s2))["unread_count"] == 1
+
+    assert await db.mark_items_read(tag="x") == 2              # a1 (already read) + b1
+    assert (await db.list_items(unread=True))[1] == 0
+    assert await db.mark_items_read(read=False, category_id=cat["id"]) == 3
+    assert (await db.list_items(unread=True))[1] == 3
+
+    a2 = next(i for i in (await db.list_items(source_id=s1))[0] if i["guid"] == "a2")
+    assert await db.mark_items_read(ids=[a2["id"]]) == 1
+    assert (await db.list_items(unread=True))[1] == 2
+    assert (await db.counts())["unread_items"] == 2
+
+
+@pytest.mark.asyncio
+async def test_unread_counts_per_source_and_category(db):
+    cat = await db.create_category("News")
+    s1 = await db.create_source("https://a.example/rss", "A", "rss", cat["id"])
+    await db.upsert_items(s1, [_item("a1", published_at=1), _item("a2", published_at=2)])
+    assert (await db.get_source(s1))["unread_count"] == 2
+    assert {c["name"]: c["unread_count"] for c in await db.list_categories()}["News"] == 2
+    a1 = next(i for i in (await db.list_items())[0] if i["guid"] == "a1")
+    await db.set_item_read(a1["id"], True)
+    assert (await db.get_source(s1))["unread_count"] == 1
+    assert {c["name"]: c["unread_count"] for c in await db.list_categories()}["News"] == 1
+    # dismissed items leave the unread pool
+    await db.set_dismissed(a1["id"], True)
+    assert (await db.get_source(s1))["unread_count"] == 1  # a1 already read; a2 still unread
+    a2 = next(i for i in (await db.list_items())[0] if i["guid"] == "a2")
+    await db.set_dismissed(a2["id"], True)
+    assert (await db.get_source(s1))["unread_count"] == 0
+    assert (await db.counts())["unread_items"] == 0
+
+
+@pytest.mark.asyncio
+async def test_list_date_range_and_ids(db):
+    sid = await db.create_source("https://example.com/rss", "Ex", "rss")
+    now = time.time()
+    await db.upsert_items(sid, [
+        _item("old", published_at=now - 3000),
+        _item("mid", published_at=now - 200),
+        _item("fresh", published_at=now - 10),
+        _item("nodate", published_at=None),
+    ])
+    lst, total = await db.list_items(since=now - 300)
+    assert {i["guid"] for i in lst} == {"mid", "fresh", "nodate"}
+    # until is exclusive; undated items fall back to first_seen (≈ now)
+    lst, total = await db.list_items(until=now - 100)
+    assert {i["guid"] for i in lst} == {"old", "mid"}
+    lst, total = await db.list_items(since=now - 300, until=now - 50)
+    assert {i["guid"] for i in lst} == {"mid"}
+    # ids narrow to an explicit set and compose with the rest
+    g_old = next(i for i in (await db.list_items())[0] if i["guid"] == "old")
+    g_fresh = next(i for i in (await db.list_items())[0] if i["guid"] == "fresh")
+    lst, total = await db.list_items(ids=[g_old["id"], g_fresh["id"]])
+    assert total == 2
+    lst, total = await db.list_items(ids=[g_old["id"], g_fresh["id"]], since=now - 300)
+    assert [i["guid"] for i in lst] == ["fresh"]
+    assert (await db.list_items(ids=[]))[1] == 0
+
+
+@pytest.mark.asyncio
+async def test_migrate_backfills_read_at(db):
+    sid = await db.create_source("https://example.com/rss", "Ex", "rss")
+    await db.upsert_items(sid, [_item("g1"), _item("g2")])
+    # simulate a pre-read_at database, then re-migrate: old rows must come
+    # back marked read so upgrading never presents a huge "unread" backlog
+    with sqlite3.connect(db.path) as conn:
+        conn.execute("DROP INDEX IF EXISTS idx_items_read")
+        conn.execute("ALTER TABLE items DROP COLUMN read_at")
+        conn.commit()
+    with sqlite3.connect(db.path) as conn:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(items)")}
+        assert "read_at" not in cols
+        Database._migrate(conn)
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(items)")}
+        assert "read_at" in cols
+        n = conn.execute("SELECT COUNT(*) FROM items WHERE read_at IS NULL").fetchone()[0]
+        assert n == 0
+    # new items, though, arrive unread
+    await db.upsert_items(sid, [_item("g3", published_at=time.time())])
+    assert (await db.list_items(unread=True))[1] == 1

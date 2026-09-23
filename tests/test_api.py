@@ -411,3 +411,85 @@ async def test_refresh_failure_records_http_error(tmp_path, monkeypatch):
         assert "HTTP 500" in row["last_error"]
     finally:
         await db.close()
+
+
+@pytest.mark.asyncio
+async def test_read_endpoints_unread_filter_and_bulk(client):
+    src = client.post("/api/sources", json={"url": "https://example.org/feed.xml"}).json()
+    db: Database = client.app.state.db
+    await db.upsert_items(src["id"], [
+        {"guid": "g1", "url": "https://example.org/1", "title": "One",
+         "published_at": time.time()},
+        {"guid": "g2", "url": "https://example.org/2", "title": "Two",
+         "published_at": time.time() - 50},
+    ])
+    items = client.get("/api/items").json()["items"]
+    assert all(i["read_at"] is None for i in items)
+    assert client.get("/api/items", params={"unread": "true"}).json()["total"] == 2
+    assert client.get("/api/health").json()["counts"]["unread_items"] == 2
+
+    iid = items[0]["id"]
+    assert client.post(f"/api/items/{iid}/read").json()["read"] is True
+    got = client.get(f"/api/items/{iid}").json()
+    assert got["read_at"] is not None
+    assert client.get("/api/items", params={"unread": "true"}).json()["total"] == 1
+    assert client.delete(f"/api/items/{iid}/read").json()["read"] is False
+    assert client.get("/api/items", params={"unread": "true"}).json()["total"] == 2
+    assert client.post("/api/items/424242/read").status_code == 404
+    assert client.delete("/api/items/424242/read").status_code == 404
+
+    r = client.post("/api/items/read-all", json={"source_id": src["id"]})
+    assert r.json()["updated"] == 2
+    assert client.get("/api/items", params={"unread": "true"}).json()["total"] == 0
+    # bulk unread over explicit ids
+    r = client.post("/api/items/read-all",
+                    json={"ids": [items[1]["id"]], "read": False})
+    assert r.json()["updated"] == 1
+    assert client.get("/api/items", params={"unread": "true"}).json()["total"] == 1
+    # empty ids list touches nothing
+    r = client.post("/api/items/read-all", json={"ids": [], "read": False})
+    assert r.json()["updated"] == 0
+
+
+@pytest.mark.asyncio
+async def test_undismiss_endpoint(client):
+    src = client.post("/api/sources", json={"url": "https://example.org/feed.xml"}).json()
+    db: Database = client.app.state.db
+    await db.upsert_items(src["id"], [
+        {"guid": "g1", "url": "https://example.org/1", "title": "One",
+         "published_at": time.time()},
+    ])
+    iid = client.get("/api/items").json()["items"][0]["id"]
+    assert client.post(f"/api/items/{iid}/dismiss").json()["dismissed"] is True
+    assert client.get("/api/items").json()["total"] == 0
+    assert client.get("/api/health").json()["counts"]["dismissed"] == 1
+    # undo: the item is back in lists, search and counts
+    assert client.delete(f"/api/items/{iid}/dismiss").json()["dismissed"] is False
+    assert client.get("/api/items").json()["total"] == 1
+    assert client.get("/api/health").json()["counts"]["dismissed"] == 0
+    assert client.delete("/api/items/424242/dismiss").status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_items_since_until_and_ids_params(client):
+    src = client.post("/api/sources", json={"url": "https://example.org/feed.xml"}).json()
+    db: Database = client.app.state.db
+    now = 1_700_000_000  # fixed epoch (2023-11-14 UTC): no midnight flakiness
+    await db.upsert_items(src["id"], [
+        {"guid": "old", "url": "u1", "title": "Old", "published_at": now - 3000},
+        {"guid": "fresh", "url": "u2", "title": "Fresh", "published_at": now - 10},
+    ])
+    got = client.get("/api/items", params={"since": now - 300}).json()
+    assert [i["guid"] for i in got["items"]] == ["fresh"]
+    got = client.get("/api/items", params={"until": now - 100}).json()
+    assert [i["guid"] for i in got["items"]] == ["old"]
+    ids = ",".join(str(i["id"]) for i in client.get("/api/items").json()["items"])
+    got = client.get("/api/items", params={"ids": ids, "since": now - 300}).json()
+    assert [i["guid"] for i in got["items"]] == ["fresh"]
+    # ISO dates work too; a date-only until includes that whole day
+    assert client.get("/api/items", params={"since": "2023-11-14"}).json()["total"] == 2
+    assert client.get("/api/items", params={"until": "2023-11-14"}).json()["total"] == 2
+    assert client.get("/api/items", params={"since": "2023-11-15"}).json()["total"] == 0
+    # garbage is rejected, not silently ignored
+    assert client.get("/api/items", params={"since": "not-a-date"}).status_code == 422
+    assert client.get("/api/items", params={"ids": "a,b"}).status_code == 422

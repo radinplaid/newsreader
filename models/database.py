@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS items (
     first_seen_at REAL,
     starred      INTEGER NOT NULL DEFAULT 0,
     dismissed    INTEGER NOT NULL DEFAULT 0,
+    read_at      REAL,
     UNIQUE (source_id, guid)
 );
 CREATE INDEX IF NOT EXISTS idx_items_source_pub ON items (source_id, published_at DESC);
@@ -139,7 +140,7 @@ _ITEM_TAGS = ("(SELECT json_group_array(t.name) FROM"
 _ITEM_COLS = f"""
     i.id, i.guid, i.title, i.summary, i.url, i.image_url, i.author,
     COALESCE(i.published_at, i.first_seen_at) AS published_at,
-    i.fetched_at, i.starred,
+    i.fetched_at, i.starred, i.read_at,
     i.source_id, s.name AS source_name, s.url AS source_url,
     c.id AS category_id, c.name AS category_name,
     {_ITEM_TAGS}
@@ -188,6 +189,14 @@ class Database:
             # existing rows: last fetch is the best available "added" date
             conn.execute("UPDATE items SET first_seen_at = fetched_at "
                          "WHERE first_seen_at IS NULL")
+        if "read_at" not in cols:
+            conn.execute("ALTER TABLE items ADD COLUMN read_at REAL")
+            # everything on disk predates unread tracking: start read,
+            # so upgrading doesn't present a backlog of thousands of "unread"
+            conn.execute("UPDATE items SET read_at = COALESCE(first_seen_at, fetched_at) "
+                         "WHERE read_at IS NULL")
+        # after the column exists (initial schema or the ALTER above)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_items_read ON items (read_at)")
         # items stored with a future date (feeds with broken CMS timezones):
         # never trustworthy, so drop them; first_seen takes over as fallback
         conn.execute("UPDATE items SET published_at = NULL "
@@ -241,7 +250,10 @@ class Database:
             SELECT c.id, c.name,
                    (SELECT COUNT(*) FROM sources s WHERE s.category_id = c.id) AS source_count,
                    (SELECT COUNT(*) FROM items i JOIN sources s2 ON s2.id = i.source_id
-                     WHERE s2.category_id = c.id AND i.dismissed = 0 AND s2.hidden = 0) AS item_count
+                     WHERE s2.category_id = c.id AND i.dismissed = 0 AND s2.hidden = 0) AS item_count,
+                   (SELECT COUNT(*) FROM items i JOIN sources s2 ON s2.id = i.source_id
+                     WHERE s2.category_id = c.id AND i.dismissed = 0 AND s2.hidden = 0
+                       AND i.read_at IS NULL) AS unread_count
             FROM categories c ORDER BY c.name COLLATE NOCASE
             """
         ) as cur:
@@ -282,7 +294,10 @@ class Database:
             """
             SELECT s.*, c.name AS category_name,
                    (SELECT COUNT(*) FROM items i
-                     WHERE i.source_id = s.id AND i.dismissed = 0) AS item_count
+                     WHERE i.source_id = s.id AND i.dismissed = 0) AS item_count,
+                   (SELECT COUNT(*) FROM items i
+                     WHERE i.source_id = s.id AND i.dismissed = 0
+                       AND i.read_at IS NULL) AS unread_count
             FROM sources s LEFT JOIN categories c ON c.id = s.category_id
             ORDER BY c.name COLLATE NOCASE, s.name COLLATE NOCASE, s.url
             """
@@ -302,7 +317,10 @@ class Database:
         async with conn.execute(
             "SELECT s.*, c.name AS category_name, "
             "(SELECT COUNT(*) FROM items i WHERE i.source_id = s.id AND i.dismissed = 0) "
-            "AS item_count FROM sources s "
+            "AS item_count, "
+            "(SELECT COUNT(*) FROM items i WHERE i.source_id = s.id AND i.dismissed = 0 "
+            " AND i.read_at IS NULL) AS unread_count "
+            "FROM sources s "
             "LEFT JOIN categories c ON c.id = s.category_id WHERE s.id=?",
             (source_id,),
         ) as cur:
@@ -364,10 +382,10 @@ class Database:
             rows = await cur.fetchall()
             return {r["guid"]: r["published_at"] for r in rows}
 
-    async def upsert_items(self, source_id: int, items: list[dict]) -> tuple[int, int]:
-        """Insert/update parsed items. Returns (inserted, updated)."""
+    async def upsert_items(self, source_id: int, items: list[dict]) -> tuple[int, int, list[int]]:
+        """Insert/update parsed items. Returns (inserted, updated, inserted_ids)."""
         if not items:
-            return (0, 0)
+            return (0, 0, [])
         existing = await self.known_dates(source_id)
         now = time.time()
         max_date = now + _FUTURE_DATE_TOLERANCE
@@ -448,17 +466,28 @@ class Database:
                     """,
                     tag_rows,
                 )
-        return (inserted, updated)
+        inserted_ids = [id_by_guid[r[1]] for r in rows if r[1] not in existing]
+        return (inserted, updated, inserted_ids)
 
     # full row (detail view); the list query omits extra/content to stay slim
     _SELECT = f"SELECT {_ITEM_COLS}, i.extra, i.content {_ITEM_FROM}"
     _SELECT_LIST = f"SELECT {_ITEM_COLS} {_ITEM_FROM}"
 
-    async def list_items(self, q: str | None = None, source_id: int | None = None,
-                   category_id: int | None = None, tag: str | None = None,
-                   starred: bool = False, sort: str = "new",
-                   limit: int = 50, offset: int = 0,
-                   include_content: bool = False) -> tuple[list[dict], int]:
+    @staticmethod
+    def _filter_items(q: str | None = None, source_id: int | None = None,
+                      category_id: int | None = None, tag: str | None = None,
+                      starred: bool = False, unread: bool = False,
+                      since: float | None = None, until: float | None = None,
+                      ids: Iterable[int] | None = None) -> tuple[str, list[str], list]:
+        """Shared WHERE/JOIN builder for item queries.
+
+        Visibility rules: dismissed items never match; hidden sources only
+        match when a source is named explicitly (that is how "clicking the
+        source itself still shows its items" works). Date bounds apply to
+        COALESCE(published_at, first_seen_at) — the effective display date.
+        `until` is exclusive. `ids=None` adds no constraint; an explicit
+        empty ids list matches nothing.
+        """
         where, args = ["i.dismissed = 0"], []
         join = ""
         match = None
@@ -472,8 +501,9 @@ class Database:
                 q = None
         if starred:
             where.append("i.starred = 1")
+        if unread:
+            where.append("i.read_at IS NULL")
         if source_id is not None:
-            # an explicit source view shows its items even when the source is hidden
             where.append("i.source_id = ?")
             args.append(source_id)
         else:
@@ -485,7 +515,39 @@ class Database:
             where.append("EXISTS (SELECT 1 FROM item_tags jt JOIN tags t ON t.id = jt.tag_id "
                          "WHERE jt.item_id = i.id AND t.name = ? COLLATE NOCASE)")
             args.append(tag)
+        if since is not None:
+            where.append("COALESCE(i.published_at, i.first_seen_at) >= ?")
+            args.append(float(since))
+        if until is not None:
+            where.append("COALESCE(i.published_at, i.first_seen_at) < ?")
+            args.append(float(until))
+        if ids is not None:
+            id_list = []
+            for i in ids:
+                try:
+                    id_list.append(int(i))
+                except (TypeError, ValueError):
+                    continue
+            id_list = id_list[:500]
+            if not id_list:
+                where.append("0 = 1")
+            else:
+                where.append(f"i.id IN ({','.join('?' * len(id_list))})")
+                args.extend(id_list)
         clause = ("WHERE " + " AND ".join(where)) if where else ""
+        return join, clause, args, match
+
+    async def list_items(self, q: str | None = None, source_id: int | None = None,
+                   category_id: int | None = None, tag: str | None = None,
+                   starred: bool = False, unread: bool = False,
+                   since: float | None = None, until: float | None = None,
+                   ids: Iterable[int] | None = None,
+                   sort: str = "new",
+                   limit: int = 50, offset: int = 0,
+                   include_content: bool = False) -> tuple[list[dict], int]:
+        join, clause, args, match = self._filter_items(
+            q=q, source_id=source_id, category_id=category_id, tag=tag,
+            starred=starred, unread=unread, since=since, until=until, ids=ids)
         if sort == "rank" and match:
             order = "ORDER BY f.frank"
         elif sort == "old":
@@ -546,6 +608,40 @@ class Database:
             async with conn.execute("UPDATE items SET dismissed=? WHERE id=?",
                                (1 if dismissed else 0, item_id)) as cur:
                 return cur.rowcount > 0
+
+    # -- read state ----------------------------------------------------------
+    async def set_item_read(self, item_id: int, read: bool) -> bool:
+        """Mark one item read (stamps read_at) or unread (clears it)."""
+        async with self.write() as conn:
+            async with conn.execute(
+                "UPDATE items SET read_at=? WHERE id=?",
+                (time.time() if read else None, item_id),
+            ) as cur:
+                return cur.rowcount > 0
+
+    async def mark_items_read(self, *, read: bool = True, ids: Iterable[int] | None = None,
+                              q: str | None = None, source_id: int | None = None,
+                              category_id: int | None = None, tag: str | None = None,
+                              starred: bool = False, since: float | None = None,
+                              until: float | None = None) -> int:
+        """Bulk mark read/unread over a filter; returns the row count touched.
+
+        Same visibility rules as listing (dismissed hidden, hidden sources
+        only when explicitly named), so "mark read" can never resurrect or
+        touch articles the user cannot see.
+        """
+        join, clause, args, _ = self._filter_items(
+            q=q, source_id=source_id, category_id=category_id, tag=tag,
+            starred=starred, since=since, until=until, ids=ids)
+        stamp = time.time() if read else None
+        async with self.write() as conn:
+            async with conn.execute(
+                f"UPDATE items SET read_at = ? WHERE id IN "
+                f"(SELECT i.id FROM items i JOIN sources s ON s.id = i.source_id "
+                f"{join} {clause})",
+                [stamp, *args],
+            ) as cur:
+                return cur.rowcount
 
     # -- tags ----------------------------------------------------------------
     async def list_tags(self) -> list[dict]:
@@ -619,6 +715,9 @@ class Database:
             "sources": await fetch_count("SELECT COUNT(*) FROM sources"),
             "enabled_sources": await fetch_count("SELECT COUNT(*) FROM sources WHERE enabled=1"),
             "items": await fetch_count("SELECT COUNT(*) FROM items WHERE dismissed=0"),
+            "unread_items": await fetch_count(
+                "SELECT COUNT(*) FROM items i JOIN sources s ON s.id = i.source_id "
+                "WHERE i.read_at IS NULL AND i.dismissed=0 AND s.hidden=0"),
             "starred_items": await fetch_count(
                 "SELECT COUNT(*) FROM items i JOIN sources s ON s.id = i.source_id "
                 "WHERE i.starred=1 AND i.dismissed=0 AND s.hidden=0"),
