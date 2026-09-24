@@ -262,7 +262,9 @@ members-only failures in `date_fetch_skip` for 3 days.
 * 1000+ sources: one `asyncio` task per source, capped by a shared semaphore;
   a failing/slow source never blocks or breaks others (per-source error state
   is recorded, shown in the UI and surfaced as a dismissible notification).
-  Conditional GETs make steady-state refreshes cheap.
+  Conditional GETs make steady-state refreshes cheap. Sources that fail
+  repeatedly rest on an exponential backoff (30 min doubling to a day,
+  `force` bypasses) instead of being retried every cycle.
 * The server never freezes during refreshes: lxml/BeautifulSoup parsing runs
   in a small process pool (`crawler/pool.py`, GIL-free — the event loop
   measured p95 3 ms while a 1.5 s parse of a 0.7 MB page was in flight),

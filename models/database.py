@@ -15,6 +15,7 @@ import sqlite3
 import time
 from contextlib import asynccontextmanager
 from typing import Iterable
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import aiosqlite
 
@@ -41,6 +42,7 @@ CREATE TABLE IF NOT EXISTS sources (
     last_refreshed_at REAL,
     last_status       TEXT NOT NULL DEFAULT '',
     last_error        TEXT NOT NULL DEFAULT '',
+    error_streak      INTEGER NOT NULL DEFAULT 0,
     created_at        REAL NOT NULL
 );
 
@@ -106,6 +108,32 @@ _fts_token = re.compile(r'"[^"]*"|\w+')
 # CMSes with broken timezones, scheduled posts): treat it as missing so the
 # first-seen fallback applies and date enrichment can look for a real date.
 _FUTURE_DATE_TOLERANCE = 300  # seconds of allowed clock skew
+
+_TRACKING_PARAMS = frozenset({
+    "fbclid", "gclid", "gbraid", "wbraid", "mc_cid", "mc_eid",
+    "igshid", "twclid", "yclid", "_hsenc", "_hsmi",
+})
+
+
+def normalize_url(url: str) -> str:
+    """Canonical identity of an entry URL.
+
+    Tracking parameters (utm_*, fbclid, ...), fragments and trailing slashes
+    are stripped so syndicated copies of one story compare equal; meaningful
+    query parameters are kept byte-for-byte unless tracking ones were removed.
+    """
+    url = (url or "").strip()
+    if not url:
+        return ""
+    parts = urlparse(url)
+    if not parts.scheme:
+        return url
+    pairs = parse_qsl(parts.query, keep_blank_values=True)
+    kept = [(k, v) for k, v in pairs
+            if k not in _TRACKING_PARAMS and not k.lower().startswith("utm_")]
+    query = parts.query if len(kept) == len(pairs) else urlencode(kept)
+    return urlunparse((parts.scheme.lower(), parts.netloc.lower(),
+                       parts.path.rstrip("/"), parts.params, query, ""))
 
 
 def fts_query(q: str) -> str | None:
@@ -205,6 +233,12 @@ class Database:
         scols = {r[1] for r in conn.execute("PRAGMA table_info(sources)")}
         if "hidden" not in scols:
             conn.execute("ALTER TABLE sources ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0")
+        if "error_streak" not in scols:
+            conn.execute("ALTER TABLE sources ADD COLUMN error_streak INTEGER NOT NULL DEFAULT 0")
+        for item_id, url in conn.execute("SELECT id, url FROM items").fetchall():
+            norm = normalize_url(url)
+            if norm != url:
+                conn.execute("UPDATE items SET url=? WHERE id=?", (norm, item_id))
 
     # -- connections ------------------------------------------------------
     async def _open_conn(self) -> aiosqlite.Connection:
@@ -348,7 +382,8 @@ class Database:
 
     async def update_source(self, source_id: int, **fields) -> bool:
         allowed = {"name", "url", "plugin", "category_id", "enabled", "hidden", "config",
-                   "etag", "last_modified", "last_refreshed_at", "last_status", "last_error"}
+                   "etag", "last_modified", "last_refreshed_at", "last_status", "last_error",
+                   "error_streak"}
         sets, args = [], []
         for key, value in fields.items():
             if key not in allowed:
@@ -385,11 +420,12 @@ class Database:
     async def upsert_items(self, source_id: int, items: list[dict]) -> tuple[int, int, list[int]]:
         """Insert/update parsed items. Returns (inserted, updated, inserted_ids).
 
-        The URL identifies an entry: a new row is inserted only when no item
-        with that URL has been added before (to any source), so the same
-        story syndicated through several feeds shows up once. Items whose
-        (source_id, guid) is already stored are updated in place as before;
-        items with an empty URL cannot be matched and are kept.
+        The URL identifies an entry (compared normalized, see normalize_url):
+        a new row is inserted only when no item with that URL has been added
+        before (to any source), so the same story syndicated through several
+        feeds shows up once. Items whose (source_id, guid) is already stored
+        are updated in place as before; items with an empty URL cannot be
+        matched and are kept.
         """
         if not items:
             return (0, 0, [])
@@ -403,7 +439,7 @@ class Database:
             if not guid or guid in seen:
                 continue
             seen.add(guid)
-            parsed.append((guid, str(it.get("url") or "").strip(), it))
+            parsed.append((guid, normalize_url(it.get("url") or ""), it))
         # URLs kept alive by in-place updates are reserved: a new guid
         # claiming one of them is the same entry again.
         reserved = {u for g, u, _ in parsed if u and g in existing}

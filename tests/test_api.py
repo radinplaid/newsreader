@@ -168,6 +168,55 @@ async def test_refresh_min_interval_skip_and_force(client, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_refresh_error_backoff_skip_and_force(client, monkeypatch):
+    from config import settings
+    monkeypatch.setattr(settings, "nr_min_refresh_minutes", 0.0)
+    src = client.post("/api/sources", json={"url": "https://example.org/feed.xml"}).json()
+    db: Database = client.app.state.db
+
+    # failed twice 20 min ago: the backoff is 60 min, so the source rests
+    await db.update_source(src["id"], last_status="error", last_error="x",
+                           error_streak=2, last_refreshed_at=time.time() - 20 * 60)
+    client.post("/api/refresh", json={})
+    status = wait_refresh_done(client)
+    assert status["total"] == 0 and status["skipped"] == 1
+
+    # explicit single-source refresh rests too unless forced
+    client.post("/api/refresh", json={"source_id": src["id"]})
+    status = wait_refresh_done(client)
+    assert status["total"] == 0 and status["skipped"] == 1
+
+    # force bypasses the backoff
+    client.post("/api/refresh", json={"source_id": src["id"], "force": True})
+    status = wait_refresh_done(client)
+    assert status["total"] == 1 and status["done"] == 1 and status["skipped"] == 0
+
+    # one failure 2 h ago: the 30 min backoff has expired, the source runs
+    await db.update_source(src["id"], last_status="error", last_error="x",
+                           error_streak=1, last_refreshed_at=time.time() - 2 * 3600)
+    client.post("/api/refresh", json={})
+    status = wait_refresh_done(client)
+    assert status["total"] == 1 and status["done"] == 1 and status["skipped"] == 0
+
+
+def test_error_backoff_grows_and_caps():
+    from fetcher import _error_backoff_secs, _in_error_backoff
+    assert _error_backoff_secs(1) == 30 * 60
+    assert _error_backoff_secs(2) == 60 * 60
+    assert _error_backoff_secs(3) == 120 * 60
+    assert _error_backoff_secs(20) == 24 * 3600
+    now = 1_700_000_000.0
+    resting = {"last_status": "error", "error_streak": 1}
+    assert _in_error_backoff({**resting, "last_refreshed_at": now - 60}, now)
+    assert not _in_error_backoff({**resting, "last_refreshed_at": now - 3600}, now)
+    # healthy or never-failed sources are never held back
+    assert not _in_error_backoff({"last_status": "ok", "error_streak": 0,
+                                  "last_refreshed_at": now - 60}, now)
+    assert not _in_error_backoff({"last_status": "error", "error_streak": 0,
+                                  "last_refreshed_at": now - 60}, now)
+
+
+@pytest.mark.asyncio
 async def test_star_and_dismiss_endpoints(client):
     src = client.post("/api/sources", json={"url": "https://example.org/feed.xml"}).json()
     db: Database = client.app.state.db
@@ -367,6 +416,7 @@ async def test_refresh_upgrades_misrouted_web_plugin(tmp_path, monkeypatch):
         sid = await db.create_source("https://www.cbc.ca/webfeed/rss/rss-topstories",
                                      "CBC", "web")
         assert (await db.get_source(sid))["plugin"] == "web"
+        await db.update_source(sid, last_status="error", error_streak=3)
 
         async def fake_fetch(self, ctx):
             return FetchResult(items=[ParsedItem(guid="g1", url="https://x/1",
@@ -381,7 +431,9 @@ async def test_refresh_upgrades_misrouted_web_plugin(tmp_path, monkeypatch):
         assert result["status"] == "ok"
         assert result["plugin"] == "rss"
         assert result["inserted"] == 1
-        assert (await db.get_source(sid))["plugin"] == "rss"
+        row = await db.get_source(sid)
+        assert row["plugin"] == "rss"
+        assert row["error_streak"] == 0
     finally:
         await db.close()
 
@@ -409,6 +461,7 @@ async def test_refresh_failure_records_http_error(tmp_path, monkeypatch):
         row = await db.get_source(sid)
         assert row["last_status"] == "error"
         assert "HTTP 500" in row["last_error"]
+        assert row["error_streak"] == 1
     finally:
         await db.close()
 

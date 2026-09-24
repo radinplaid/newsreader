@@ -24,6 +24,23 @@ log = logging.getLogger("newsreader.fetcher")
 USER_AGENT = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 
+_ERROR_BACKOFF_BASE = 30 * 60.0     # seconds to rest after the first failure
+_ERROR_BACKOFF_MAX = 24 * 3600.0    # cap for the exponential backoff
+
+
+def _error_backoff_secs(fail_streak: int) -> float:
+    """Seconds a source with fail_streak consecutive errors should rest:
+    30 min, doubling per failure, capped at a day."""
+    return min(_ERROR_BACKOFF_MAX, _ERROR_BACKOFF_BASE * (2 ** max(0, fail_streak - 1)))
+
+
+def _in_error_backoff(src: dict, now: float) -> bool:
+    """True while a repeatedly failing source should be left alone."""
+    streak = int(src.get("error_streak") or 0)
+    if streak < 1 or src.get("last_status") != "error":
+        return False
+    return now - (src.get("last_refreshed_at") or 0) < _error_backoff_secs(streak)
+
 
 def _error_text(exc: BaseException) -> str:
     """Readable error line; walks the cause chain when str(exc) is empty.
@@ -135,18 +152,21 @@ class Fetcher:
             else:
                 sources = [s for s in await self.db.list_sources() if s["enabled"]]
             min_minutes = settings.nr_min_refresh_minutes
-            if not force and min_minutes > 0:
-                cutoff = time.time() - min_minutes * 60
+            if not force:
+                now = time.time()
+                cutoff = now - min_minutes * 60 if min_minutes > 0 else None
                 pending, skipped = [], 0
                 for s in sources:
-                    if (s.get("last_refreshed_at") or 0) > cutoff:
+                    if cutoff is not None and (s.get("last_refreshed_at") or 0) > cutoff:
+                        skipped += 1
+                    elif _in_error_backoff(s, now):
                         skipped += 1
                     else:
                         pending.append(s)
                 if skipped:
                     self.status["skipped"] = skipped
-                    log.info("skipping %d source(s) refreshed within the last %.0f min",
-                             skipped, min_minutes)
+                    log.info("skipping %d source(s): refreshed recently or resting "
+                             "after repeated errors", skipped)
                 sources = pending
             self.status["total"] = len(sources)
             self.events.publish({"type": "snapshot", **self.snapshot()})
@@ -230,7 +250,7 @@ class Fetcher:
                     await self.db.update_source(src["id"], config=merged)
                 fields = {
                     "last_refreshed_at": time.time(), "last_status": "ok", "last_error": "",
-                    "plugin": plugin.name,
+                    "plugin": plugin.name, "error_streak": 0,
                 }
                 if ctx.etag:
                     fields["etag"] = ctx.etag
@@ -245,6 +265,7 @@ class Fetcher:
                 await self.db.update_source(
                     src["id"], last_refreshed_at=time.time(),
                     last_status="error", last_error=result["error"],
+                    error_streak=int(src.get("error_streak") or 0) + 1,
                 )
             result["duration"] = round(time.time() - started, 2)
         return result

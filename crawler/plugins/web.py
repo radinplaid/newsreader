@@ -459,6 +459,7 @@ class WebPlugin(Plugin):
     async def fetch(self, ctx: FetchContext) -> FetchResult:
         items: list[dict] = []
         source_name = None
+        config_updates: dict = {}
         url = ctx.source["url"]
 
         # a feed discovered on an earlier refresh: parse it directly
@@ -511,10 +512,12 @@ class WebPlugin(Plugin):
             # many sites are WordPress/etc. with a feed the homepage advertises:
             # prefer it over heuristic scraping when the listing looks thin
             if last_text is not None and (len(items) < 3 or not items):
-                feed_items, feed_name = await self._try_discovered_feed(ctx, last_text, url)
+                feed_items, feed_name, discovered = await self._try_discovered_feed(
+                    ctx, last_text, url)
                 if feed_items:
                     items = feed_items
                     source_name = feed_name
+                    config_updates["feed_url"] = discovered
 
         limit = int(ctx.config.get("max_items", 300))
         items = items[:limit]
@@ -522,7 +525,8 @@ class WebPlugin(Plugin):
         if ctx.config.get("fetch_content", True):
             await self._enrich_from_pages(ctx, items)
 
-        return FetchResult(items=[ParsedItem(**i) for i in items], source_name=source_name)
+        return FetchResult(items=[ParsedItem(**i) for i in items],
+                           source_name=source_name, config_updates=config_updates)
 
     async def _items_from_feed(self, ctx, feed_url: str, page_url: str) -> tuple[list[dict], str | None]:
         from crawler.plugins.rss import _parse_feed
@@ -534,16 +538,16 @@ class WebPlugin(Plugin):
         return [i.to_row() for i in parsed[:limit]], name or ctx.source.get("name") or None
 
     async def _try_discovered_feed(self, ctx, page_text: str, page_url: str):
-        """If the page advertises a same-host feed, try to use it. On success
-        the feed URL is persisted in the source config so later refreshes skip
-        the discovery round-trip."""
+        """If the page advertises a same-host feed, try to use it. Returns
+        (items, name, feed_url); the caller persists the feed URL in the
+        source config so later refreshes skip the discovery round-trip."""
         feed_url = await run_parse(_discover_feed_url_from, page_text, page_url)
         if not feed_url or feed_url == page_url:
-            return [], None
+            return [], None, None
         parsed, name = await _fetch_feed(ctx, feed_url)
         if not parsed:
-            return [], None
-        return [i.to_row() for i in parsed], name
+            return [], None, None
+        return [i.to_row() for i in parsed], name, feed_url
 
     async def _enrich_from_pages(self, ctx: FetchContext, items: list[dict]) -> None:
         """Fetch article pages for new items and for items still missing a

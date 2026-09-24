@@ -81,6 +81,13 @@ MENU_HTML = """
 <div class="list"><a href="/blog/only-post"><h3>The Only Post</h3><p>Text of it.</p><p>Aug 2, 2026</p></a></div>
 </body></html>"""
 
+THIN_WITH_FEED = """
+<html><head>
+<link rel="alternate" type="application/rss+xml" href="/feed.xml">
+</head><body>
+<div class="list"><a href="/blog/only-post"><h3>The Only Post</h3><p>Text of it.</p><p>Aug 2, 2026</p></a></div>
+</body></html>"""
+
 # Drupal/Tailwind cards (posit.co style): the title anchor lives inside an h3
 # and carries a generic CTA aria-label; image is a root-relative <picture>;
 # date is a plain-text ISO string (no <time> element).
@@ -324,6 +331,35 @@ async def test_web_plugin_parses_feed_document():
     await ctx.client.aclose()
     assert result.source_name == "Sample Feed"
     assert [i.title for i in result.items] == ["First post", "Second post"]
+
+
+@pytest.mark.asyncio
+async def test_web_plugin_persists_discovered_feed_url():
+    def handler(request):
+        if request.url.path.endswith("feed.xml"):
+            return httpx.Response(200, text=RSS_XML)
+        return httpx.Response(200, text=THIN_WITH_FEED)
+
+    ctx = _mock_ctx(handler, url="https://ex.com/blog",
+                    config={"fetch_content": False})
+    result = await WebPlugin().fetch(ctx)
+    await ctx.client.aclose()
+    assert result.config_updates == {"feed_url": "https://ex.com/feed.xml"}
+    assert result.source_name == "Sample Feed"
+    assert [i.url for i in result.items] == ["https://ex.com/1", "https://ex.com/2"]
+
+
+@pytest.mark.asyncio
+async def test_web_plugin_reports_no_feed_url_when_none_discovered():
+    def handler(request):
+        return httpx.Response(200, text=MENU_HTML)
+
+    ctx = _mock_ctx(handler, url="https://ex.com/blog",
+                    config={"fetch_content": False})
+    result = await WebPlugin().fetch(ctx)
+    await ctx.client.aclose()
+    assert result.config_updates == {}
+    assert [i.guid for i in result.items] == ["https://ex.com/blog/only-post"]
 
 
 @pytest.mark.asyncio

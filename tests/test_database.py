@@ -5,7 +5,7 @@ import time
 import pytest
 import pytest_asyncio
 
-from models.database import Database, fts_query
+from models.database import Database, fts_query, normalize_url
 
 
 @pytest_asyncio.fixture()
@@ -142,6 +142,61 @@ async def test_upsert_update_reserves_url_against_new_guid(db):
     assert (await db.upsert_items(sid, items))[:2] == (0, 1)
     _, total = await db.list_items(source_id=sid)
     assert total == 1
+
+
+def test_normalize_url():
+    assert normalize_url("https://Ex.com/a/?utm_source=rss&utm_medium=feed") == \
+        "https://ex.com/a"
+    assert normalize_url("https://ex.com/a?fbclid=xyz&id=7#frag") == \
+        "https://ex.com/a?id=7"
+    assert normalize_url("https://ex.com/watch?v=abc&t=10s") == \
+        "https://ex.com/watch?v=abc&t=10s"
+    assert normalize_url("https://ex.com/") == "https://ex.com"
+    assert normalize_url("u1") == "u1"
+    assert normalize_url("  ") == "" and normalize_url(None) == ""
+
+
+@pytest.mark.asyncio
+async def test_upsert_dedupes_tracking_param_variants(db):
+    sid = await db.create_source("https://example.com/rss", "Ex", "rss")
+    await db.upsert_items(sid, [_item("g1", url="https://example.com/story?utm_source=rss")])
+    ins, upd, ids = await db.upsert_items(
+        sid, [_item("g2", url="https://example.com/story/?utm_source=mail&fbclid=abc")])
+    assert (ins, upd, ids) == (0, 0, [])
+    lst, total = await db.list_items(source_id=sid)
+    assert total == 1
+    assert lst[0]["url"] == "https://example.com/story"
+
+
+@pytest.mark.asyncio
+async def test_migrate_normalizes_stored_urls(tmp_path):
+    path = str(tmp_path / "mig.db")
+    db = Database(path)
+    await db.init()
+    sid = await db.create_source("https://example.com/rss", "Ex", "rss")
+    async with db.write() as conn:
+        await conn.execute(
+            "INSERT INTO items (source_id, guid, url, fetched_at) VALUES (?, ?, ?, ?)",
+            (sid, "g1", "https://Example.com/a/?utm_campaign=x", time.time()))
+    await db.close()
+    db2 = Database(path)
+    await db2.init()
+    try:
+        lst, _ = await db2.list_items(source_id=sid)
+        assert lst[0]["url"] == "https://example.com/a"
+    finally:
+        await db2.close()
+
+
+@pytest.mark.asyncio
+async def test_source_error_streak(db):
+    sid = await db.create_source("https://example.com/rss", "Ex", "rss")
+    assert (await db.get_source(sid))["error_streak"] == 0
+    await db.update_source(sid, last_status="error", error_streak=2)
+    src = await db.get_source(sid)
+    assert src["error_streak"] == 2 and src["last_status"] == "error"
+    await db.update_source(sid, last_status="ok", error_streak=0)
+    assert (await db.get_source(sid))["error_streak"] == 0
 
 
 @pytest.mark.asyncio
