@@ -90,7 +90,11 @@ const ICONS = {
   pencil: '<path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/>',
   download: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/>',
   upload: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M17 8l-5-5-5 5"/><path d="M12 3v12"/>',
+  transfer: '<path d="M7 4v16"/><path d="M4 7l3-3 3 3"/><path d="M17 20V4"/><path d="M14 17l3 3 3-3"/>',
+  chevron: '<path d="M9 6l6 6-6 6"/>',
+  arrowUp: '<path d="M12 19V5M5 12l7-7 7 7"/>',
   help: '<circle cx="12" cy="12" r="10"/><path d="M9.2 9.2a3 3 0 0 1 5.7 1c0 2-2.9 2.8-2.9 2.8"/><path d="M12 17h.01"/>',
+  github: '<path d="M9 19c-4.3 1.3-4.3-2.2-6-2.7M15 22v-3.9a3.4 3.4 0 0 0-.9-2.7c3-.3 6.2-1.5 6.2-6.9a5.4 5.4 0 0 0-1.5-3.8 5 5 0 0 0-.1-3.7s-1.2-.3-3.8 1.5a13 13 0 0 0-6.9 0C5.4.7 4.2 1 4.2 1a5 5 0 0 0-.1 3.7 5.4 5.4 0 0 0-1.5 3.8c0 5.4 3.2 6.6 6.2 6.9a3.4 3.4 0 0 0-.9 2.7V22"/>',
   alert: '<path d="M10.3 4L2.4 18a2 2 0 0 0 1.7 3h15.8a2 2 0 0 0 1.7-3L13.7 4a2 2 0 0 0-3.4 0z"/><path d="M12 9v4"/><path d="M12 17h.01"/>',
   checks: '<path d="M2 12.5L6 16.5 11.5 8"/><path d="M12 15l3 3L22 6"/>',
   check: '<path d="M20 6L9 17l-5-5"/>',
@@ -336,8 +340,10 @@ async function loadItems(reset = true) {
     if (reset) $("#itemList").replaceChildren();
     renderItems(reset ? data.items : novel);
     renderChips();
+    return true;
   } catch (err) {
     toast(`Failed to load items: ${err.message}`, true);
+    return false;
   } finally {
     $("#moreLoading")?.remove();
     state.loading = false;
@@ -373,8 +379,10 @@ async function loadSidebar() {
       `${health.counts.items} items · ${state.unreadCount} unread · ${health.counts.sources} sources`;
     renderSidebar();
     checkSourceErrors(state.sources);
+    return true;
   } catch (err) {
     toast(`Failed to load sidebar: ${err.message}`, true);
+    return false;
   }
 }
 
@@ -743,6 +751,19 @@ function rowNoimg() {
   return el("div", { class: "row-noimg" }, icon("paper"));
 }
 
+function fmtScore(n) {
+  if (n >= 10000) return `${(n / 1000).toFixed(0)}k`;
+  if (n >= 1000) return `${(n / 1000).toFixed(1).replace(/\.0$/, "")}k`;
+  return String(n);
+}
+
+function itemScore(item) {
+  const s = item.extra && item.extra.score;
+  if (typeof s !== "number") return null;
+  return el("div", { class: "row-score", title: `${s} upvotes` },
+    icon("arrowUp"), el("span", {}, fmtScore(s)));
+}
+
 function renderItems(items, opts = {}) {
   const list = $("#itemList");
   const frag = document.createDocumentFragment();
@@ -794,6 +815,7 @@ function renderItems(items, opts = {}) {
           item.starred ? el("span", { class: "starred", title: "Starred" }, "★") : null,
           item.category_name ? el("span", {}, item.category_name) : null,
           el("span", {}, timeago(item.published_at))),
+        itemScore(item),
         item.summary
           ? el("p", { class: "row-summary" }, ...highlightNodes(item.summary, state.q)) : null,
         (item.tags || []).length ? el("div", { class: "row-tags" },
@@ -920,8 +942,12 @@ function youtubeFacade(vid, title, thumbUrl) {
 
 /* the reader's lead visual: a player facade for videos, else the hero image */
 function heroNode(item) {
-  const vid = youtubeId(item.url);
+  const linkUrl = item.extra && item.extra.kind === "reddit" ? (item.extra.link_url || "") : "";
+  const vid = youtubeId(item.url) || youtubeId(linkUrl);
   if (vid) return youtubeFacade(vid, item.title, item.image_url);
+  // reddit items carry their media in the body; a hero would show it twice
+  if (item.extra && item.extra.kind === "reddit" && /<(img|video)\b/.test(item.content || ""))
+    return null;
   return item.image_url
     ? el("img", { class: "rd-hero", src: item.image_url, alt: "",
         onerror: (ev) => ev.target.remove() })
@@ -1131,8 +1157,10 @@ function renderReader(item, slide = 0) {
         } catch (err) { toast(err.message, true); }
       } }));
 
-  const heroVid = youtubeId(item.url);
+  const heroVid = youtubeId(item.url) ||
+    (item.extra && item.extra.kind === "reddit" ? youtubeId(item.extra.link_url || "") : null);
   const heroSkip = heroVid ? new Set([heroVid]) : new Set();
+  const isReddit = item.extra && item.extra.kind === "reddit";
   const kids = [
     el("div", { class: "rd-meta" },
       el("span", { class: "src" }, item.source_name || ""),
@@ -1142,7 +1170,7 @@ function renderReader(item, slide = 0) {
     el("h1", { class: "rd-title" },
       el("a", {
         href: item.url, target: "_blank", rel: "noopener noreferrer",
-        title: "Open original",
+        title: isReddit ? "Open on Reddit" : "Open original",
       }, item.title || "(untitled)")),
     heroNode(item),
     tagEditor,
@@ -1150,7 +1178,7 @@ function renderReader(item, slide = 0) {
     item.content ? contentNode(item.content, item._sanitized, heroSkip) : null,
     el("div", { class: "rd-foot" },
       el("a", { href: item.url, target: "_blank", rel: "noopener noreferrer" },
-        "Open original ↗")),
+        isReddit ? "Open on Reddit ↗" : "Open original ↗")),
   ].filter((k) => k instanceof Node);
   const wrap = el("div", { class: "reader-content" }, kids);
   inner.replaceChildren(wrap);
@@ -1796,17 +1824,119 @@ $("#readerDismiss").addEventListener("click", () => {
   if (state.selected) dismissItem(state.selected);
 });
 
+/* ---------------- reddit source options (add / edit dialogs) ---------------- */
+const RD_TIME_VALUES = new Set(["hour", "day", "week", "month", "year", "all"]);
+
+function parseRedditUrl(url) {
+  const raw = (url || "").trim();
+  if (!raw) return null;
+  let u;
+  try { u = new URL(/^https?:\/\//i.test(raw) ? raw : "https://" + raw); }
+  catch (_e) { return null; }
+  if (!/(^|\.)reddit\.com$/i.test(u.hostname)) return null;
+  const m = u.pathname.match(
+    /^\/r\/([A-Za-z0-9_+]+)(?:\/(top|hot|new|rising|controversial))?\/?$/i);
+  if (!m) return null;
+  return { sub: m[1], listing: (m[2] || "hot").toLowerCase(),
+           t: (u.searchParams.get("t") || "").toLowerCase() };
+}
+
+function composeRedditUrl({ sub, listing, t }) {
+  const clean = (sub || "").trim().replace(/^\/?r\//i, "").replace(/[^A-Za-z0-9_+]/g, "");
+  const path = `https://www.reddit.com/r/${clean || "subreddit"}/${listing}/`;
+  return listing === "top" || listing === "controversial"
+    ? `${path}?t=${t || "week"}` : path;
+}
+
+function wireRedditPanel(form, panel, opts = {}) {
+  const els = form.elements;
+  const preview = panel.querySelector(".rd-preview");
+  const timeRow = panel.querySelector(".rd-time-row");
+
+  function setVisible(visible) {
+    panel.classList.toggle("hidden", !visible);
+    els.rd_min_score.required = visible;
+    if (opts.onChange) opts.onChange(visible);
+  }
+
+  function compose() {
+    const listing = els.rd_listing.value;
+    timeRow.classList.toggle("hidden",
+      !(listing === "top" || listing === "controversial"));
+    const url = composeRedditUrl({ sub: els.rd_sub.value, listing, t: els.rd_time.value });
+    if (preview) preview.textContent = url;
+    return url;
+  }
+
+  function sync(url, config) {
+    const rd = parseRedditUrl(url);
+    if (!rd) { setVisible(false); return false; }
+    els.rd_sub.value = rd.sub;
+    els.rd_listing.value = rd.listing;
+    els.rd_time.value = RD_TIME_VALUES.has(rd.t) ? rd.t : "week";
+    if (config && config.min_score != null) els.rd_min_score.value = config.min_score;
+    if (config && config.external_only != null)
+      els.rd_external_only.checked = !!config.external_only;
+    compose();
+    setVisible(true);
+    return true;
+  }
+
+  els.url.addEventListener("input", () => sync(els.url.value));
+  for (const name of ["rd_sub", "rd_listing", "rd_time"]) {
+    const keep = () => { els.url.value = compose(); };
+    els[name].addEventListener("input", keep);
+    els[name].addEventListener("change", keep);
+  }
+
+  return {
+    active: () => !panel.classList.contains("hidden"),
+    sync,
+    data() {
+      const minScore = parseInt(els.rd_min_score.value, 10);
+      return {
+        sub: els.rd_sub.value.trim().replace(/^\/?r\//i, "").replace(/[^A-Za-z0-9_+]/g, ""),
+        url: compose(),
+        config: {
+          min_score: Number.isFinite(minScore) ? Math.max(0, minScore) : null,
+          external_only: !!els.rd_external_only.checked,
+        },
+      };
+    },
+  };
+}
+
+function redditFormData(rd) {
+  if (!rd.active()) return null;
+  const data = rd.data();
+  if (!data.sub) { toast("Enter a subreddit name", true); return null; }
+  if (data.config.min_score === null) {
+    toast("Enter the minimum score (upvotes) for posts to include", true);
+    return null;
+  }
+  return data;
+}
+
+const addReddit = wireRedditPanel($("#addForm"), $("#addReddit"));
+const editReddit = wireRedditPanel($("#editForm"), $("#editReddit"), {
+  onChange: (visible) => $("#editConfigRow").classList.toggle("hidden", visible),
+});
+
 $("#addBtn").addEventListener("click", () => $("#addDialog").showModal());
 $("#addCancel").addEventListener("click", () => $("#addDialog").close());
 $("#addForm").addEventListener("submit", async (ev) => {
   ev.preventDefault();
   const form = new FormData(ev.target);
+  const rd = addReddit.active() ? redditFormData(addReddit) : null;
+  if (addReddit.active() && !rd) return;
   try {
     const src = await api("/sources", { method: "POST",
       body: JSON.stringify({
-        url: form.get("url"), name: form.get("name") || "",
+        url: rd ? rd.url : form.get("url"),
+        name: form.get("name") || "",
         category_id: form.get("category_id") ? Number(form.get("category_id")) : null,
         category_name: form.get("category_name") || null,
+        config: rd ? rd.config : {},
       }),
       headers: { "Content-Type": "application/json" } });
     $("#addDialog").close();
@@ -1820,44 +1950,133 @@ $("#addForm").addEventListener("submit", async (ev) => {
   } catch (err) { toast(err.message, true); }
 });
 
-/* ---------------- export / import sources ---------------- */
-$("#exportBtn").addEventListener("click", async () => {
-  try {
-    const data = await api("/sources/export");
-    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
-    const a = el("a", {
-      href: URL.createObjectURL(blob),
-      download: `newsreader-sources-${new Date().toISOString().slice(0, 10)}.json`,
-    });
-    a.click();
-    URL.revokeObjectURL(a.href);
-    toast(`Exported ${data.sources.length} sources`);
-  } catch (err) { toast(err.message, true); }
+/* ---------------- source transfer dialog ---------------- */
+const sourcesDialog = $("#sourcesDialog");
+let pendingImport = null;
+let transferBusy = false;
+
+function transferStatus(message, error = false) {
+  $("#sourcesStatus").textContent = message;
+  $("#sourcesStatus").classList.toggle("error", error);
+}
+
+function setTransferBusy(busy) {
+  transferBusy = busy;
+  sourcesDialog.setAttribute("aria-busy", String(busy));
+  for (const id of ["sourcesImport", "sourcesExport", "sourcesImportConfirm", "sourcesImportCancel", "sourcesClose"]) {
+    $(`#${id}`).disabled = busy;
+  }
+}
+
+function clearPendingImport() {
+  pendingImport = null;
+  $("#importConfirmation").classList.add("hidden");
+}
+
+$("#ioBtn").addEventListener("click", () => {
+  clearPendingImport();
+  transferStatus("");
+  sourcesDialog.showModal();
+});
+$("#sourcesClose").addEventListener("click", () => sourcesDialog.close());
+sourcesDialog.addEventListener("cancel", (ev) => {
+  if (transferBusy) ev.preventDefault();
+});
+sourcesDialog.addEventListener("close", () => {
+  clearPendingImport();
+  $("#ioBtn").focus();
+});
+$("#sourcesImport").addEventListener("click", () => $("#importFile").click());
+$("#sourcesImportCancel").addEventListener("click", () => {
+  clearPendingImport();
+  transferStatus("Import canceled. No sources changed.");
+  $("#sourcesImport").focus();
 });
 
-$("#importBtn").addEventListener("click", () => $("#importFile").click());
+function downloadText(text, type, filename) {
+  const a = el("a", { href: URL.createObjectURL(new Blob([text], { type })), download: filename });
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+$("#sourcesExport").addEventListener("click", async () => {
+  if (transferBusy) return;
+  setTransferBusy(true);
+  transferStatus("Preparing your sources…");
+  try {
+    const res = await fetch("/api/sources/export.opml");
+    if (!res.ok) throw new Error(`Export failed (${res.status})`);
+    const text = await res.text();
+    downloadText(text, "application/xml",
+      `newsreader-sources-${new Date().toISOString().slice(0, 10)}.opml`);
+    transferStatus("Sources exported as OPML.");
+  } catch (err) {
+    transferStatus(err.message, true);
+  } finally {
+    setTransferBusy(false);
+  }
+});
 
 $("#importFile").addEventListener("change", async (ev) => {
   const file = ev.target.files && ev.target.files[0];
   ev.target.value = "";
   if (!file) return;
-  let doc;
+  clearPendingImport();
+  setTransferBusy(true);
+  transferStatus("Reading your file…");
   try {
-    doc = JSON.parse(await file.text());
-  } catch (_e) { return toast("Not a valid JSON file", true); }
-  const sources = Array.isArray(doc) ? doc : doc.sources;
-  if (!Array.isArray(sources)) return toast("File has no sources array", true);
-  if (!sources.length) return toast("Nothing to import", true);
-  if (!confirm(`Import ${sources.length} source(s) from ${file.name}? Existing sources with the same URL will be updated.`)) return;
+    const text = (await file.text()).trimStart();
+    if (!text.trim()) throw new Error("This file is empty.");
+    if (text.startsWith("{") || text.startsWith("[")) {
+      let doc;
+      try { doc = JSON.parse(text); }
+      catch (_err) { throw new Error("Not a valid JSON file."); }
+      const sources = Array.isArray(doc) ? doc : doc.sources;
+      if (!Array.isArray(sources)) throw new Error("File has no sources array.");
+      if (!sources.length) { transferStatus("Nothing to import."); return; }
+      if (sources.some((s) => !s || typeof s !== "object" || Array.isArray(s) || typeof s.url !== "string")) {
+        throw new Error("Each source must have a URL.");
+      }
+      pendingImport = { path: "/sources/import", body: JSON.stringify({ sources }), type: "application/json" };
+    } else {
+      // Keep original XML bytes so its declared encoding remains authoritative.
+      pendingImport = { path: "/sources/import.opml", body: file, type: "application/xml" };
+    }
+    $("#importFilename").textContent = `Ready to import: ${file.name}`;
+    $("#importConfirmation").classList.remove("hidden");
+    transferStatus("");
+  } catch (err) {
+    transferStatus(err.message, true);
+  } finally {
+    setTransferBusy(false);
+    if (pendingImport) $("#sourcesImportConfirm").focus();
+  }
+});
+
+$("#sourcesImportConfirm").addEventListener("click", async () => {
+  if (transferBusy || !pendingImport) return;
+  setTransferBusy(true);
+  transferStatus("Importing sources…");
   try {
-    const res = await api("/sources/import", { method: "POST",
-      body: JSON.stringify({ sources }),
-      headers: { "Content-Type": "application/json" } });
-    const bits = [`${res.created} added`, `${res.updated} updated`];
-    if (res.skipped) bits.push(`${res.skipped} skipped`);
-    toast(`Import done: ${bits.join(", ")}`);
-    refreshSidebar();
-  } catch (err) { toast(err.message, true); }
+    const res = await api(pendingImport.path, { method: "POST",
+      body: pendingImport.body, headers: { "Content-Type": pendingImport.type } });
+    clearPendingImport();
+    transferStatus(res.created || res.updated || res.skipped
+      ? `Import complete: ${res.created} added, ${res.updated} updated, ${res.skipped} skipped.`
+      : "Nothing to import.");
+    try {
+      const sidebarLoaded = await loadSidebar();
+      const itemsLoaded = await loadItems(true);
+      if (sidebarLoaded === false || itemsLoaded === false) throw new Error("The updated view is unavailable");
+    } catch (err) {
+      transferStatus(`Sources imported, but the view could not refresh: ${err.message}. Reload to see the changes.`, true);
+    }
+  } catch (err) {
+    transferStatus(`Import failed: ${err.message}. Some sources may already have changed; retrying will not duplicate them.`, true);
+  } finally {
+    setTransferBusy(false);
+    $(pendingImport ? "#sourcesImportConfirm" : "#sourcesImport").focus();
+  }
 });
 
 $("#addCatBtn").addEventListener("click", async () => {
@@ -1893,6 +2112,7 @@ function openEditDialog(src) {
   }
   $("#editHint").textContent =
     `Plugin: ${src.plugin}. Changing the URL re-detects the plugin and refreshes the source.`;
+  editReddit.sync(src.url, src.config || {});
   $("#editDialog").showModal();
 }
 
@@ -1916,14 +2136,22 @@ $("#editForm").addEventListener("submit", async (ev) => {
   if (!editingSource) return;
   const form = ev.target;
   let config = {};
-  const raw = form.elements.config.value.trim();
-  if (raw) {
-    try { config = JSON.parse(raw); }
-    catch (_e) { return toast("Advanced options must be valid JSON", true); }
+  let url = form.elements.url.value.trim();
+  if (editReddit.active()) {
+    const rd = redditFormData(editReddit);
+    if (!rd) return;
+    url = rd.url;
+    config = rd.config;
+  } else {
+    const raw = form.elements.config.value.trim();
+    if (raw) {
+      try { config = JSON.parse(raw); }
+      catch (_e) { return toast("Advanced options must be valid JSON", true); }
+    }
   }
   const body = {
     name: form.elements.name.value.trim(),
-    url: form.elements.url.value.trim(),
+    url,
     enabled: form.elements.enabled.checked,
     hidden: !form.elements.hidden.checked,
     category_id: form.elements.category_id.value ? Number(form.elements.category_id.value) : null,

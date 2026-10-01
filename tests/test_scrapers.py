@@ -1,13 +1,17 @@
 """Offline parser tests: fixture HTML/XML snippets, no network."""
+import json
 import time
 
 import pytest
 import httpx
 
 from crawler import find_plugin
-from crawler.base import FetchContext
+from crawler.base import FetchContext, FetchError
 from crawler.plugins import youtube as yt_mod
 from crawler.plugins.arxiv import ArxivPlugin, parse_abs_page, parse_search_page
+from crawler.plugins.reddit import RedditPlugin, parse_listing as reddit_parse_listing
+from crawler.plugins.reddit import parse_target as reddit_parse_target
+from crawler.plugins.reddit import challenge_solution, is_challenge_page
 from crawler.plugins.rss import _parse_feed
 from crawler.plugins.web import WebPlugin, extract_article, extract_listing
 
@@ -308,6 +312,9 @@ def test_registry_routing():
     assert find_plugin("https://arxiv.org/abs/2609.14795").name == "arxiv"
     assert find_plugin("https://www.aisi.gov.uk/blog").name == "web"
     assert find_plugin("https://some-blog.example/posts").name == "web"
+    assert find_plugin(
+        "https://www.reddit.com/r/ottawa/top/?screen_view_count=6&t=week").name == "reddit"
+    assert find_plugin("https://reddit.com/r/programming").name == "reddit"
 
 
 def _mock_ctx(handler, url="https://example.com/x", known_dates=None, config=None):
@@ -595,3 +602,299 @@ async def test_youtube_date_fetch_skips_remembered_failures(monkeypatch):
     by_guid = {i.guid: i for i in result.items}
     assert by_guid["v2"].published_at is not None
     assert by_guid["v1"].published_at is None
+
+
+def _reddit_child(pid, **kw):
+    data = {
+        "kind": "t3", "name": f"t3_{pid}", "id": pid, "title": f"Post {pid}",
+        "permalink": f"/r/ottawa/comments/{pid}/post_{pid}/",
+        "url": f"https://www.reddit.com/r/ottawa/comments/{pid}/post_{pid}/",
+        "is_self": True, "selftext": "", "author": "someone",
+        "created_utc": 1758400000, "score": 100, "num_comments": 5,
+        "subreddit": "ottawa", "domain": "self.ottawa",
+        "thumbnail": "self", "link_flair_text": None,
+    }
+    data.update(kw)
+    return {"kind": "t3", "data": data}
+
+
+def _reddit_payload(children, after=None):
+    return json.dumps({"kind": "Listing",
+                       "data": {"after": after, "children": children}})
+
+
+def test_reddit_parse_target():
+    sub, listing, t = reddit_parse_target(
+        "https://www.reddit.com/r/ottawa/top/?screen_view_count=6&t=week")
+    assert (sub, listing, t) == ("ottawa", "top", "week")
+    assert reddit_parse_target("https://reddit.com/r/programming") == \
+        ("programming", "hot", "")
+    assert reddit_parse_target("https://old.reddit.com/r/ottawa+canada/new/") == \
+        ("ottawa+canada", "new", "")
+    with pytest.raises(FetchError):
+        reddit_parse_target("https://www.reddit.com/r/ottawa/comments/abc/a_post/")
+    with pytest.raises(FetchError):
+        reddit_parse_target("https://www.reddit.com/user/someone/")
+
+
+def test_reddit_parse_listing_maps_fields():
+    posts = reddit_parse_listing(_reddit_payload([
+        _reddit_child("a", score=250, is_self=False,
+                      url="https://ottawacitizen.com/news/local",
+                      domain="ottawacitizen.com", link_flair_text="News",
+                      thumbnail="https://b.thumbs.redditmedia.com/x.jpg"),
+        _reddit_child("b", score=120, selftext="Long self post."),
+        _reddit_child("c", score=80, is_self=False,
+                      url="https://www.reddit.com/gallery/xyz",
+                      domain="reddit.com"),
+        {"kind": "t1", "data": {"id": "ignored"}},
+    ]))
+    by = {p["guid"]: p for p in posts}
+    assert set(by) == {"t3_a", "t3_b", "t3_c"}
+    a = by["t3_a"]
+    assert a["url"] == "https://www.reddit.com/r/ottawa/comments/a/post_a/"
+    assert a["title"] == "Post a"
+    assert a["tags"] == ["News"]
+    assert a["image_url"] == "https://b.thumbs.redditmedia.com/x.jpg"
+    assert a["published_at"] == 1758400000
+    assert a["extra"] == {"kind": "reddit", "subreddit": "ottawa", "score": 250,
+                          "num_comments": 5,
+                          "permalink": "https://www.reddit.com/r/ottawa/comments/a/post_a/",
+                          "domain": "ottawacitizen.com", "external": True,
+                          "link_url": "https://ottawacitizen.com/news/local"}
+    assert a["content"] == ('<p class="md-link"><a href="https://ottawacitizen.com/news/local"'
+                            ' title="https://ottawacitizen.com/news/local">'
+                            'ottawacitizen.com ↗</a></p>')
+    b = by["t3_b"]
+    assert b["url"] == "https://www.reddit.com/r/ottawa/comments/b/post_b/"
+    assert b["summary"] == "Long self post."
+    assert b["extra"]["external"] is False
+    assert b["content"] == ""
+    c = by["t3_c"]
+    assert c["extra"]["external"] is False
+    assert c["url"] == "https://www.reddit.com/r/ottawa/comments/c/post_c/"
+    assert "reddit.com/gallery/xyz" not in c["content"]
+
+
+@pytest.mark.asyncio
+async def test_reddit_min_score_filter_and_json_url():
+    fetched = []
+    children = [
+        _reddit_child("a", score=250, is_self=False,
+                      url="https://ottawacitizen.com/news/local",
+                      domain="ottawacitizen.com"),
+        _reddit_child("b", score=120, selftext="Long self post."),
+        _reddit_child("c", score=80, is_self=False,
+                      url="https://www.ex.com/story", domain="ex.com"),
+        _reddit_child("d", score=15),
+    ]
+
+    def handler(request):
+        fetched.append(str(request.url))
+        return httpx.Response(200, text=_reddit_payload(children))
+
+    url = "https://www.reddit.com/r/ottawa/top/?screen_view_count=6&t=week"
+    ctx = _mock_ctx(handler, url=url, config={"min_score": 100, "page_delay": 0})
+    result = await RedditPlugin().fetch(ctx)
+    await ctx.client.aclose()
+    assert len(fetched) == 1
+    req = httpx.URL(fetched[0])
+    assert req.host == "www.reddit.com" and req.path == "/r/ottawa/top.json"
+    assert req.params["t"] == "week"
+    assert req.params["raw_json"] == "1"
+    assert req.params["limit"] == "100"
+    assert "screen_view_count" not in req.params
+    assert [i.guid for i in result.items] == ["t3_a", "t3_b"]
+    assert all(i.extra["score"] >= 100 for i in result.items)
+    assert result.items[0].url == "https://www.reddit.com/r/ottawa/comments/a/post_a/"
+    assert "https://ottawacitizen.com/news/local" in result.items[0].content
+    assert result.source_name == "r/ottawa · top · week"
+
+
+@pytest.mark.asyncio
+async def test_reddit_external_only():
+    def handler(request):
+        return httpx.Response(200, text=_reddit_payload([
+            _reddit_child("a", score=250, is_self=False,
+                          url="https://www.ex.com/story", domain="ex.com"),
+            _reddit_child("b", score=200, selftext="A self post."),
+        ]))
+
+    ctx = _mock_ctx(handler, url="https://www.reddit.com/r/ottawa/top/",
+                    config={"external_only": True, "page_delay": 0})
+    result = await RedditPlugin().fetch(ctx)
+    await ctx.client.aclose()
+    assert [i.guid for i in result.items] == ["t3_a"]
+
+
+@pytest.mark.asyncio
+async def test_reddit_top_stops_paging_below_min_score():
+    """top is score-descending: once a page falls under min_score, deeper
+    pages cannot contain qualifying posts and pagination stops."""
+    fetched = []
+
+    def handler(request):
+        fetched.append(str(request.url))
+        if request.url.params.get("after"):
+            return httpx.Response(200, text=_reddit_payload(
+                [_reddit_child("d", score=40), _reddit_child("e", score=10)]))
+        return httpx.Response(200, text=_reddit_payload(
+            [_reddit_child("a", score=300), _reddit_child("b", score=200),
+             _reddit_child("c", score=50)], after="t3_c"))
+
+    ctx = _mock_ctx(handler, url="https://www.reddit.com/r/ottawa/top/?t=week",
+                    config={"min_score": 100, "page_delay": 0})
+    result = await RedditPlugin().fetch(ctx)
+    await ctx.client.aclose()
+    assert len(fetched) == 1
+    assert [i.guid for i in result.items] == ["t3_a", "t3_b"]
+
+
+@pytest.mark.asyncio
+async def test_reddit_new_stops_paging_on_known_items():
+    fetched = []
+
+    def handler(request):
+        fetched.append(str(request.url))
+        if request.url.params.get("after"):
+            return httpx.Response(200, text=_reddit_payload([_reddit_child("c")]))
+        return httpx.Response(200, text=_reddit_payload(
+            [_reddit_child("a"), _reddit_child("b")], after="t3_b"))
+
+    ctx = _mock_ctx(handler, url="https://www.reddit.com/r/ottawa/new/",
+                    known_dates={"t3_b": 1.0}, config={"page_delay": 0})
+    result = await RedditPlugin().fetch(ctx)
+    await ctx.client.aclose()
+    assert len(fetched) == 1
+    assert [i.guid for i in result.items] == ["t3_a", "t3_b"]
+
+
+CHALLENGE_HTML = """<html><head><title>reddit</title></head><body>
+<form hidden method="GET" action="/r/ottawa/top/">
+<input type="hidden" name="solution" />
+<input type="hidden" name="js_challenge" value="1"/>
+<input type="hidden" name="jsc_token" value="tok123"/>
+<input type="hidden" name="jsc_orig_r" value=""/>
+</form>
+<script nonce="x">document.addEventListener("DOMContentLoaded",async function(){
+var e=document.forms[0],n=(e.onsubmit=function(t){return true},
+await(async e=>e+e)("e7354e52cd020c8a"));e.elements.namedItem("solution").value=n,
+e.requestSubmit()},{once:true});</script>
+</body></html>"""
+
+
+def test_reddit_challenge_solution():
+    assert is_challenge_page(CHALLENGE_HTML)
+    assert not is_challenge_page("<html><body>Blocked</body></html>")
+    url = challenge_solution(CHALLENGE_HTML, "https://www.reddit.com/r/ottawa/top/?t=week")
+    assert url is not None
+    parsed = httpx.URL(url)
+    assert parsed.path == "/r/ottawa/top/"
+    assert parsed.params["t"] == "week"
+    assert parsed.params["solution"] == "e7354e52cd020c8ae7354e52cd020c8a"
+    assert parsed.params["js_challenge"] == "1"
+    assert parsed.params["jsc_token"] == "tok123"
+    assert parsed.params["jsc_orig_r"] == ""
+    assert challenge_solution("<html></html>", "https://ex.com/x") is None
+
+
+@pytest.mark.asyncio
+async def test_reddit_solves_js_challenge_when_blocked():
+    """Reddit gates logged-out .json access with a verification page on some
+    networks: the plugin solves it and retries, once."""
+    calls = []
+
+    def handler(request):
+        u = str(request.url)
+        calls.append(u)
+        if request.url.path.endswith(".json"):
+            if any("solution=" in c for c in calls):
+                return httpx.Response(200, text=_reddit_payload(
+                    [_reddit_child("a", score=250)]))
+            return httpx.Response(403, text="<html><body>blocked</body></html>")
+        if "solution=" in u:
+            return httpx.Response(200, text="<html><body>real page</body></html>")
+        return httpx.Response(200, text=CHALLENGE_HTML)
+
+    ctx = _mock_ctx(handler, url="https://www.reddit.com/r/ottawa/top/?t=week",
+                    config={"page_delay": 0})
+    result = await RedditPlugin().fetch(ctx)
+    await ctx.client.aclose()
+    assert [i.guid for i in result.items] == ["t3_a"]
+    assert len(calls) == 4  # .json, challenge page, solve, .json retry
+    solve = next(c for c in calls if "solution=" in c)
+    assert "solution=e7354e52cd020c8ae7354e52cd020c8a" in solve
+    assert "js_challenge=1" in solve and "jsc_token=tok123" in solve
+
+
+@pytest.mark.asyncio
+async def test_reddit_blocked_without_challenge_fails_clearly():
+    def handler(request):
+        return httpx.Response(403, text="<html><body>blocked</body></html>")
+
+    ctx = _mock_ctx(handler, url="https://www.reddit.com/r/ottawa/top/",
+                    config={"page_delay": 0})
+    with pytest.raises(FetchError, match="blocking unauthenticated"):
+        await RedditPlugin().fetch(ctx)
+    await ctx.client.aclose()
+
+
+def test_reddit_media_gallery_video_image():
+    gallery = _reddit_child(
+        "g", is_self=False, url="https://www.reddit.com/gallery/g", domain="reddit.com",
+        is_gallery=True,
+        gallery_data={"items": [{"media_id": "m2"}, {"media_id": "m1"}]},
+        media_metadata={
+            "m1": {"s": {"u": "https://i.redd.it/one.jpg"}},
+            "m2": {"s": {"u": "https://i.redd.it/two.jpg"}},
+        })
+    video = _reddit_child(
+        "v", is_self=False, url="https://v.redd.it/abc", domain="v.redd.it",
+        secure_media={"reddit_video": {
+            "fallback_url": "https://v.redd.it/abc/DASH_720.mp4?source=fallback"}},
+        preview={"images": [{"source": {"url": "https://i.redd.it/prev.jpg"}}]})
+    image = _reddit_child("i", is_self=False, url="https://i.redd.it/pic.png",
+                          domain="i.redd.it")
+    text = _reddit_child("s", selftext="plain text",
+                         selftext_html='<div class="md"><p>rich &amp; good</p></div>')
+    by = {p["guid"]: p for p in reddit_parse_listing(
+        _reddit_payload([gallery, video, image, text]))}
+
+    g = by["t3_g"]
+    assert g["image_url"] == "https://i.redd.it/two.jpg"  # gallery order
+    assert g["content"].count("<img") == 2
+    assert g["content"].index("two.jpg") < g["content"].index("one.jpg")
+    assert "video" not in g["extra"]
+
+    v = by["t3_v"]
+    assert v["extra"]["video"] is True
+    assert v["image_url"] == "https://i.redd.it/prev.jpg"
+    assert '<video class="md-media" controls preload="metadata"' in v["content"]
+    assert 'poster="https://i.redd.it/prev.jpg"' in v["content"]
+    assert '<source src="https://v.redd.it/abc/DASH_720.mp4" type="video/mp4">' in v["content"]
+
+    i = by["t3_i"]
+    assert i["image_url"] == "https://i.redd.it/pic.png"
+    assert '<img src="https://i.redd.it/pic.png"' in i["content"]
+    assert "video" not in i["extra"]
+
+    s = by["t3_s"]
+    assert "rich &amp; good" in s["content"]
+    assert s["content"].startswith("<div class=\"md\">")
+    assert s["image_url"] == ""
+
+
+@pytest.mark.asyncio
+async def test_reddit_top_defaults_to_past_week():
+    fetched = []
+
+    def handler(request):
+        fetched.append(str(request.url))
+        return httpx.Response(200, text=_reddit_payload([]))
+
+    ctx = _mock_ctx(handler, url="https://www.reddit.com/r/ottawa/top/",
+                    config={"page_delay": 0})
+    result = await RedditPlugin().fetch(ctx)
+    await ctx.client.aclose()
+    assert httpx.URL(fetched[0]).params["t"] == "week"
+    assert result.source_name == "r/ottawa · top · week"

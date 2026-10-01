@@ -13,7 +13,7 @@ from dataclasses import asdict
 
 import httpx
 
-from config import settings
+from .config import settings
 
 import crawler
 from crawler.base import FetchContext, FetchError

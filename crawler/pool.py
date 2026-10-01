@@ -19,7 +19,7 @@ from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from typing import Any, Callable, TypeVar
 
-from config import settings
+from newsreader.config import settings
 
 log = logging.getLogger("newsreader.parsepool")
 

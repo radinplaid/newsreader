@@ -339,7 +339,22 @@ button.chip:hover { color: var(--text); border-color: var(--text-3); }
   transform: translateY(-50%);
   pointer-events: none;
 }
-.topbar-actions { display: flex; align-items: center; gap: 6px; }
+.topbar-actions { display: flex; align-items: center; gap: 16px; flex: none; }
+.source-actions { display: flex; align-items: center; gap: 8px; }
+.source-actions .btn { white-space: nowrap; min-height: 36px; }
+.sources-btn { color: var(--text-2); }
+.utility-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding-left: 12px;
+  border-left: 1px solid var(--border);
+}
+.utility-actions .icon-btn { color: var(--text-3); }
+.utility-actions .icon-btn:hover { color: var(--text); }
+.add-label-mobile { display: none; }
+.article-sort { margin-left: auto; font-size: 12px; padding: 5px 26px 5px 9px; }
+#filterChips:not(:empty) { flex-basis: 100%; }
 
 /* ---------------------------------------------------------------- shell */
 .shell {
@@ -474,7 +489,6 @@ button.chip:hover { color: var(--text); border-color: var(--text-3); }
   color: var(--text-3);
 }
 .refresh-status { color: var(--accent); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.side-foot-row { display: flex; gap: 8px; }
 .scrim { display: none; }
 
 /* ---------------------------------------------------------------- list */
@@ -517,6 +531,7 @@ button.chip:hover { color: var(--text); border-color: var(--text-3); }
 .list-tools .btn .icon { width: 14px; height: 14px; }
 .toolbar {
   display: flex;
+  align-items: center;
   flex-wrap: wrap;
   gap: 8px;
   padding: 0 16px 10px;
@@ -693,6 +708,15 @@ button.chip:hover { color: var(--text); border-color: var(--text-3); }
 .row-meta .src { color: var(--accent); font-weight: 600; }
 .row-meta .sep { opacity: 0.55; }
 .row-meta .starred { color: var(--star); }
+.row-score {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11.5px;
+  font-weight: 650;
+  color: var(--accent);
+}
+.row-score .icon { width: 12px; height: 12px; }
 .row-summary {
   font-size: 12.5px;
   line-height: 1.45;
@@ -998,6 +1022,29 @@ iframe.yt-frame {
   height: auto;
   border-radius: var(--radius-sm);
 }
+.content figure.md-media { margin: 0; }
+.content p.md-link {
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  font-size: 13.5px;
+}
+.content p.md-link a { font-weight: 650; }
+.content p.media-note {
+  margin: 4px 0 0;
+  font-size: 12px;
+  color: var(--text-3);
+}
+.content video.md-media {
+  display: block;
+  width: 100%;
+  max-width: 620px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  border: 1px solid var(--border-soft);
+}
 .content pre {
   overflow-x: auto;
   padding: 12px 14px;
@@ -1082,10 +1129,45 @@ iframe.yt-frame {
 .modal label.check input { width: auto; margin: 0; accent-color: var(--accent); }
 .modal .hint { font-size: 12px; font-weight: 400; color: var(--text-3); margin: -4px 0 14px; }
 .modal .opt { opacity: 0.6; font-weight: 400; }
+.reddit-panel {
+  display: grid;
+  gap: 12px;
+  margin: 0 0 14px;
+  padding: 12px 14px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+}
+.reddit-panel legend {
+  padding: 0 6px;
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+.reddit-panel label { margin: 0; }
+.reddit-panel .hint { margin: -2px 0 0; }
+.reddit-panel .rd-preview {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+  color: var(--text-2);
+}
 .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }
 .modal-actions.space-between { justify-content: space-between; }
 .modal-actions .btn.danger:hover { background: var(--danger-soft); }
+
+.source-transfer { padding: 18px 0; border-top: 1px solid var(--border-soft); }
+.source-transfer h4 { margin: 0 0 8px; font-size: 14px; }
+.source-transfer p { margin: 0 0 12px; color: var(--text-2); font-size: 13px; line-height: 1.6; }
+.source-transfer .btn { min-height: 44px; }
+.import-confirmation { margin-top: 14px; padding: 14px; background: var(--surface-hover); border-radius: var(--radius); }
+#importFilename { color: var(--text); font-weight: 550; overflow-wrap: anywhere; }
+.transfer-status { min-height: 20px; margin: 8px 0 14px; color: var(--text-2); font-size: 13px; overflow-wrap: anywhere; }
+.transfer-status.error { color: var(--danger); }
+.sources-modal button:disabled { opacity: 0.55; cursor: wait; }
 
 .help-modal { width: min(620px, 92vw); }
 .help-grid {
@@ -1336,14 +1418,22 @@ iframe.yt-frame {
 }
 
 @media (max-width: 640px) {
-  .topbar { gap: 6px; padding-left: calc(10px + var(--safe-left));
+  :root { --topbar-h: 106px; }
+  .topbar { gap: 6px; flex-wrap: wrap; align-content: center;
+            padding-left: calc(10px + var(--safe-left));
             padding-right: calc(10px + var(--safe-right)); }
-  .searchwrap { min-width: 0; }
+  .topbar .brand { display: none; }
+  .topbar-actions { margin-left: auto; gap: 8px; }
+  .source-actions { gap: 4px; }
+  .source-actions .btn { padding: 7px 8px; font-size: 12px; }
+  .utility-actions { gap: 2px; padding-left: 6px; }
+  .topbar .icon-btn { width: 34px; height: 40px; }
+  .add-label-desktop { display: none; }
+  .add-label-mobile { display: inline; }
+  .searchwrap { order: 1; flex: 0 0 100%; max-width: none; min-width: 0; margin: 0; }
   #search { padding-right: 38px; }
   .search-clear { right: 8px; }
   .btn-label { display: none; }
-  .topbar-actions .select { padding: 6px 24px 6px 8px; font-size: 12.5px; }
-  #helpBtn { display: none; }
   .list-head { padding: 14px 14px 8px; }
   .toolbar { padding: 0 14px 8px; }
   .items { padding: 0 6px 24px; }
@@ -1353,6 +1443,10 @@ iframe.yt-frame {
   .reader-actions .btn { padding: 6px 9px; min-height: 36px; }
   .form-grid { grid-template-columns: 1fr; gap: 0; }
   .modal { padding: 18px; }
+}
+
+@media (max-width: 360px) {
+  .topbar .icon-btn { width: 28px; }
 }
 
 @media (prefers-reduced-motion: reduce) {

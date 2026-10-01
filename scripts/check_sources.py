@@ -20,7 +20,7 @@ import httpx  # noqa: E402
 
 import crawler  # noqa: E402
 from crawler.base import FetchContext  # noqa: E402
-from fetcher import USER_AGENT  # noqa: E402
+from newsreader.fetcher import USER_AGENT  # noqa: E402
 from models.database import Database  # noqa: E402
 
 

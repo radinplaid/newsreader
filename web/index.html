@@ -26,14 +26,17 @@
     <kbd id="searchShortcut">/</kbd>
   </div>
   <div class="topbar-actions">
-    <select id="sortSel" class="select" title="Sort order" aria-label="Sort order">
-      <option value="new">Newest first</option>
-      <option value="old">Oldest first</option>
-      <option value="rank">Relevance</option>
-    </select>
-    <button id="themeBtn" class="icon-btn" aria-label="Toggle theme" title="Toggle theme"></button>
-    <button id="helpBtn" class="icon-btn" data-icon="help" aria-label="Keyboard shortcuts" title="Keyboard shortcuts (?)"></button>
-    <button id="addBtn" class="btn primary add-btn" title="Add a news source"><span data-icon="plus"></span><span class="btn-label">Source</span></button>
+    <div class="source-actions" role="group" aria-label="Source actions">
+      <button id="ioBtn" class="btn ghost sources-btn" aria-haspopup="dialog"
+              aria-controls="sourcesDialog" title="Import / export sources">Sources</button>
+      <button id="addBtn" class="btn primary add-btn" title="Add a news source"><span data-icon="plus"></span><span class="add-label-desktop">Add source</span><span class="add-label-mobile">Source</span></button>
+    </div>
+    <div class="utility-actions" role="group" aria-label="App utilities">
+      <button id="themeBtn" class="icon-btn" aria-label="Toggle theme" title="Toggle theme"></button>
+      <button id="helpBtn" class="icon-btn" data-icon="help" aria-label="Keyboard shortcuts" title="Keyboard shortcuts (?)"></button>
+      <a class="icon-btn" data-icon="github" href="https://github.com/radinplaid/newsreader"
+         target="_blank" rel="noopener noreferrer" aria-label="Newsreader on GitHub (opens in a new tab)" title="Newsreader on GitHub"></a>
+    </div>
   </div>
 </header>
 
@@ -70,11 +73,6 @@
       <button id="refreshBtn" class="btn primary block">
         <span id="refreshIcon" class="icon-slot" data-icon="refresh"></span> Refresh all
       </button>
-      <div class="side-foot-row">
-        <button id="exportBtn" class="btn ghost grow" title="Download all sources (no articles) as JSON"><span data-icon="download"></span> Export</button>
-        <button id="importBtn" class="btn ghost grow" title="Import sources from an exported JSON file"><span data-icon="upload"></span> Import</button>
-        <input id="importFile" type="file" accept="application/json,.json" class="hidden" tabindex="-1">
-      </div>
     </footer>
   </aside>
   <div id="scrim" class="scrim"></div>
@@ -98,6 +96,11 @@
           <button type="button" class="chip" data-range="30d">30 days</button>
           <button type="button" class="chip" data-range="">All time</button>
         </div>
+        <select id="sortSel" class="select article-sort" title="Sort order" aria-label="Sort order">
+          <option value="new">Newest</option>
+          <option value="old">Oldest</option>
+          <option value="rank">Relevance</option>
+        </select>
         <div id="filterChips" class="chips"></div>
       </div>
       <button id="newPill" class="new-pill hidden" type="button"></button>
@@ -145,7 +148,44 @@
     <label>URL
       <input name="url" type="url" required placeholder="https://example.com/blog" autocomplete="off">
     </label>
-    <p class="hint" id="pluginHint">RSS/Atom feeds, YouTube playlists &amp; channels, arXiv searches, and plain blog or news listing pages all work.</p>
+    <p class="hint" id="pluginHint">RSS/Atom feeds, YouTube playlists &amp; channels, arXiv searches, Reddit subreddits, and plain blog or news listing pages all work.</p>
+    <fieldset class="reddit-panel hidden" id="addReddit">
+      <legend>Reddit options</legend>
+      <div class="form-grid">
+        <label>Subreddit
+          <input name="rd_sub" type="text" placeholder="ottawa" autocomplete="off" spellcheck="false">
+        </label>
+        <label>Show me
+          <select name="rd_listing">
+            <option value="top" selected>Top posts</option>
+            <option value="hot">Hot</option>
+            <option value="new">New</option>
+            <option value="rising">Rising</option>
+            <option value="controversial">Controversial</option>
+          </select>
+        </label>
+      </div>
+      <div class="form-grid">
+        <label class="rd-time-row">Top posts from
+          <select name="rd_time">
+            <option value="hour">Past hour</option>
+            <option value="day">Past day</option>
+            <option value="week" selected>Past week</option>
+            <option value="month">Past month</option>
+            <option value="year">Past year</option>
+            <option value="all">All time</option>
+          </select>
+        </label>
+        <label>Minimum score <span class="opt">(upvotes)</span>
+          <input name="rd_min_score" type="number" min="0" step="1" value="100" required inputmode="numeric">
+        </label>
+      </div>
+      <label class="check">
+        <input name="rd_external_only" type="checkbox">
+        Only posts linking outside Reddit
+      </label>
+      <p class="hint">Posts below the minimum score are skipped. Source URL: <code class="rd-preview"></code></p>
+    </fieldset>
     <label>Name <span class="opt">(optional)</span>
       <input name="name" type="text" placeholder="My blog" autocomplete="off">
     </label>
@@ -175,6 +215,43 @@
       <input name="url" type="url" required autocomplete="off">
     </label>
     <p class="hint" id="editHint"></p>
+    <fieldset class="reddit-panel hidden" id="editReddit">
+      <legend>Reddit options</legend>
+      <div class="form-grid">
+        <label>Subreddit
+          <input name="rd_sub" type="text" placeholder="ottawa" autocomplete="off" spellcheck="false">
+        </label>
+        <label>Show me
+          <select name="rd_listing">
+            <option value="top" selected>Top posts</option>
+            <option value="hot">Hot</option>
+            <option value="new">New</option>
+            <option value="rising">Rising</option>
+            <option value="controversial">Controversial</option>
+          </select>
+        </label>
+      </div>
+      <div class="form-grid">
+        <label class="rd-time-row">Top posts from
+          <select name="rd_time">
+            <option value="hour">Past hour</option>
+            <option value="day">Past day</option>
+            <option value="week" selected>Past week</option>
+            <option value="month">Past month</option>
+            <option value="year">Past year</option>
+            <option value="all">All time</option>
+          </select>
+        </label>
+        <label>Minimum score <span class="opt">(upvotes)</span>
+          <input name="rd_min_score" type="number" min="0" step="1" value="100" required inputmode="numeric">
+        </label>
+      </div>
+      <label class="check">
+        <input name="rd_external_only" type="checkbox">
+        Only posts linking outside Reddit
+      </label>
+      <p class="hint">Posts below the minimum score are skipped. Source URL: <code class="rd-preview"></code></p>
+    </fieldset>
     <div class="form-grid">
       <label>Category
         <select name="category_id" id="editCatSel"></select>
@@ -189,7 +266,7 @@
     <label class="check">
       <input name="hidden" type="checkbox"> Show articles in the combined feed
     </label>
-    <label>Advanced options <span class="opt">(JSON, plugin-specific)</span>
+    <label id="editConfigRow">Advanced options <span class="opt">(JSON, plugin-specific)</span>
       <textarea name="config" rows="4" spellcheck="false" placeholder='{"max_items": 100}'></textarea>
     </label>
     <div class="modal-actions space-between">
@@ -200,6 +277,35 @@
       </span>
     </div>
   </form>
+</dialog>
+
+<!-- source transfer dialog -->
+<dialog id="sourcesDialog" class="modal sources-modal" aria-labelledby="sourcesTitle" aria-describedby="sourcesScope">
+  <h3 id="sourcesTitle">Sources</h3>
+  <p id="sourcesScope" class="hint">Move your sources between readers or keep a copy of your setup. Articles and read/starred state are not included.</p>
+  <section class="source-transfer" aria-labelledby="importTitle">
+    <h4 id="importTitle">Bring your sources in</h4>
+    <p>Choose an OPML file from another reader or a previous Newsreader export. Older JSON exports work too.</p>
+    <button type="button" class="btn primary" id="sourcesImport">Import sources…</button>
+    <input id="importFile" type="file" accept=".opml,.xml,.json,text/x-opml,application/xml,application/json" class="hidden" tabindex="-1">
+    <div id="importConfirmation" class="import-confirmation hidden">
+      <p id="importFilename"></p>
+      <p>Matching URLs will update only settings supplied by the file. Other settings and existing articles stay unchanged.</p>
+      <div class="modal-actions">
+        <button type="button" class="btn ghost" id="sourcesImportCancel">Cancel</button>
+        <button type="button" class="btn primary" id="sourcesImportConfirm">Import</button>
+      </div>
+    </div>
+  </section>
+  <section class="source-transfer" aria-labelledby="exportTitle">
+    <h4 id="exportTitle">Take your sources with you</h4>
+    <p>Download OPML with your categories and Newsreader source settings. Other readers may ignore custom settings or non-feed sources. Share carefully: exports can contain private URLs and configuration.</p>
+    <button type="button" class="btn" id="sourcesExport">Export sources</button>
+  </section>
+  <p id="sourcesStatus" class="transfer-status" role="status" aria-live="polite" aria-atomic="true"></p>
+  <div class="modal-actions">
+    <button type="button" class="btn ghost" id="sourcesClose">Close</button>
+  </div>
 </dialog>
 
 <!-- keyboard shortcuts dialog -->

@@ -9,14 +9,14 @@ from fastapi.testclient import TestClient
 
 import api.app as app_module
 from crawler.base import FetchContext
-from fetcher import EventBus, Fetcher, _error_text
+from newsreader.fetcher import EventBus, Fetcher, _error_text
 from models.database import Database
 
 
 @pytest_asyncio.fixture()
 def client(tmp_path, monkeypatch):
     monkeypatch.setenv("NR_DB_PATH", str(tmp_path / "api.db"))
-    from config import settings
+    from newsreader.config import settings
     settings.nr_db_path = str(tmp_path / "api.db")
     monkeypatch.setenv("NR_WEB_DIR", str(tmp_path / "noweb"))
     import importlib
@@ -143,7 +143,7 @@ def wait_refresh_done(client):
 @pytest.mark.asyncio
 async def test_refresh_min_interval_skip_and_force(client, monkeypatch):
     monkeypatch.setenv("NR_MIN_REFRESH_MINUTES", "15")
-    from config import settings
+    from newsreader.config import settings
     settings.nr_min_refresh_minutes = 15
     src = client.post("/api/sources", json={"url": "https://example.org/feed.xml"}).json()
 
@@ -169,7 +169,7 @@ async def test_refresh_min_interval_skip_and_force(client, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_refresh_error_backoff_skip_and_force(client, monkeypatch):
-    from config import settings
+    from newsreader.config import settings
     monkeypatch.setattr(settings, "nr_min_refresh_minutes", 0.0)
     src = client.post("/api/sources", json={"url": "https://example.org/feed.xml"}).json()
     db: Database = client.app.state.db
@@ -200,7 +200,7 @@ async def test_refresh_error_backoff_skip_and_force(client, monkeypatch):
 
 
 def test_error_backoff_grows_and_caps():
-    from fetcher import _error_backoff_secs, _in_error_backoff
+    from newsreader.fetcher import _error_backoff_secs, _in_error_backoff
     assert _error_backoff_secs(1) == 30 * 60
     assert _error_backoff_secs(2) == 60 * 60
     assert _error_backoff_secs(3) == 120 * 60
@@ -324,6 +324,73 @@ async def test_export_import_sources(client):
     # entries no plugin can handle are skipped
     r = client.post("/api/sources/import", json={
         "sources": [{"url": "not-a-url"}]})
+    assert r.json()["skipped"] == 1
+
+
+@pytest.mark.asyncio
+async def test_export_import_sources_opml(client):
+    cat = client.post("/api/categories", json={"name": "News"}).json()
+    client.post("/api/sources", json={
+        "url": "https://example.org/feed.xml", "name": "Example Feed",
+        "category_id": cat["id"], "config": {"max_items": 5}})
+    client.post("/api/sources", json={
+        "url": "https://www.youtube.com/playlist?list=PLabc123", "name": "Videos"})
+
+    r = client.get("/api/sources/export.opml")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("application/xml")
+    assert "newsreader-sources.opml" in r.headers.get("content-disposition", "")
+    xml = r.text
+    assert xml.startswith("<?xml")
+    assert "<opml" in xml and 'version="2.0"' in xml
+    assert 'xmlUrl="https://example.org/feed.xml"' in xml
+    assert 'text="News"' in xml
+
+    # wipe and re-import into an empty-ish db
+    for s in client.get("/api/sources").json()["sources"]:
+        client.delete(f"/api/sources/{s['id']}")
+    for c in client.get("/api/categories").json()["categories"]:
+        client.delete(f"/api/categories/{c['id']}")
+
+    r = client.post("/api/sources/import.opml", content=xml)
+    assert r.status_code == 200
+    res = r.json()
+    assert res["ok"] is True and res["created"] == 2 and res["updated"] == 0
+    assert res["skipped"] == 0
+
+    sources = client.get("/api/sources").json()["sources"]
+    assert len(sources) == 2
+    feed = next(s for s in sources if s["url"] == "https://example.org/feed.xml")
+    assert feed["name"] == "Example Feed" and feed["plugin"] == "rss"
+    assert feed["category_name"] == "News"
+    assert feed["config"] == {"max_items": 5}
+    videos = next(s for s in sources if "youtube.com" in s["url"])
+    assert videos["plugin"] == "youtube" and videos["category_name"] is None
+
+    # importing the same document again updates instead of duplicating
+    r = client.post("/api/sources/import.opml", content=xml)
+    assert r.json()["updated"] == 2 and r.json()["created"] == 0
+    assert len(client.get("/api/sources").json()["sources"]) == 2
+
+    # an explicit plugin attribute wins over URL-based detection
+    r = client.post("/api/sources/import.opml", content=(
+        '<opml version="2.0"><body>'
+        '<outline text="Heist" xmlUrl="https://example.org/other.xml" plugin="web"/>'
+        '</body></opml>'))
+    assert r.json()["created"] == 1
+    heist = next(s for s in client.get("/api/sources").json()["sources"]
+                 if s["url"] == "https://example.org/other.xml")
+    assert heist["plugin"] == "web"
+
+    # malformed XML is rejected
+    r = client.post("/api/sources/import.opml", content=b"this is not xml")
+    assert r.status_code == 422
+
+    # URLs nothing can be done with are skipped
+    r = client.post("/api/sources/import.opml", content=(
+        '<opml version="2.0"><body>'
+        '<outline text="Bad" xmlUrl="not-a-url"/>'
+        '</body></opml>'))
     assert r.json()["skipped"] == 1
 
 
@@ -546,3 +613,148 @@ async def test_items_since_until_and_ids_params(client):
     # garbage is rejected, not silently ignored
     assert client.get("/api/items", params={"since": "not-a-date"}).status_code == 422
     assert client.get("/api/items", params={"ids": "a,b"}).status_code == 422
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("plugin", ["rss", "youtube", "reddit", "arxiv", "web"])
+@pytest.mark.parametrize("format", ["json", "opml"])
+async def test_source_transfer_fresh_and_update(client, plugin, format):
+    from newsreader.opml import export_opml
+
+    row = {"url": "https://example.org/feed.xml?a=1&b=2", "name": "",
+           "plugin": plugin, "category": 'Research & "News"',
+           "enabled": False, "hidden": True,
+           "config": {"nested": {"list": [False, None, '<&"', 3]}}}
+    def transfer():
+        if format == "json":
+            return client.post("/api/sources/import", json={"sources": [row]})
+        return client.post("/api/sources/import.opml", content=export_opml(
+            [{**row, "category_name": row["category"]}]).encode())
+
+    assert transfer().json() == {"ok": True, "created": 1, "updated": 0, "skipped": 0}
+    src = client.get("/api/sources").json()["sources"][0]
+    sid = src["id"]
+    for key in ("url", "name", "plugin", "enabled", "hidden", "config"):
+        assert src[key] == row[key]
+    assert src["category_name"] == row["category"]
+    db = client.app.state.db
+    await db.upsert_items(sid, [{"guid": "retained", "url": "https://example.org/1",
+                                 "title": "Retained", "published_at": time.time()}])
+    items, _ = await db.list_items(source_id=sid)
+    iid = items[0]["id"]
+    await db.set_starred(iid, True)
+    await db.update_source(sid, plugin="web" if plugin != "web" else "rss",
+                           name="Changed", enabled=True, hidden=False, config={"old": 1})
+    assert transfer().json() == {"ok": True, "created": 0, "updated": 1, "skipped": 0}
+    restored = client.get(f"/api/sources/{sid}").json()
+    for key in ("name", "plugin", "enabled", "hidden", "config"):
+        assert restored[key] == row[key]
+    assert restored["id"] == sid
+    assert (await db.get_source(sid))["item_count"] == 1
+    item = await db.get_item(iid)
+    assert item["guid"] == "retained" and item["starred"] is True
+    exported = client.get("/api/sources/export").json()["sources"][0]
+    assert exported == row
+    row.update(category=None, config={})
+    transfer()
+    restored = client.get(f"/api/sources/{sid}").json()
+    assert restored["category_id"] is None and restored["config"] == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("format", ["json", "opml"])
+async def test_import_omissions_duplicates_and_unknown_plugins(client, format):
+    src = client.post("/api/sources", json={"url": "https://example.org/feed.xml",
+        "name": "Original", "category_name": "Keep", "config": {"keep": True}}).json()
+    sid = src["id"]
+    await client.app.state.db.update_source(sid, enabled=False, hidden=True, plugin="web")
+    if format == "json":
+        r = client.post("/api/sources/import", json={"sources": [
+            {"url": " example.org/feed.xml "},
+            {"url": src["url"], "name": "First"},
+            {"url": src["url"], "name": "Last"},
+            {"url": src["url"], "plugin": "unknown", "category": "Never"},
+            {"url": "https://new.example/", "plugin": "unknown", "category": "Never"},
+            {"url": "ftp://invalid", "category": "Never"}]})
+    else:
+        r = client.post("/api/sources/import.opml", content='''<opml><body>
+          <outline url=" example.org/feed.xml " config="not-json"/>
+          <outline url="https://example.org/feed.xml" text="First" config="[1]"/>
+          <outline url="https://example.org/feed.xml" text="Last"/>
+          <outline url="https://example.org/feed.xml" plugin="unknown" category="Never"/>
+          <outline url="https://new.example/" plugin="unknown" category="Never"/>
+          <outline url="ftp://invalid" category="Never"/>
+        </body></opml>''')
+    assert r.json() == {"ok": True, "created": 0, "updated": 3, "skipped": 3}
+    restored = client.get(f"/api/sources/{sid}").json()
+    assert restored["name"] == "Last"
+    for key in ("category_id", "config"):
+        assert restored[key] == src[key]
+    assert restored["enabled"] is False and restored["hidden"] is True
+    assert restored["plugin"] == "web"
+    assert [c["name"] for c in client.get("/api/categories").json()["categories"]] == ["Keep"]
+
+
+@pytest.mark.asyncio
+async def test_import_new_duplicates_and_explicit_false(client):
+    r = client.post("/api/sources/import", json={"sources": [
+        {"url": "new.example/feed.xml", "plugin": "web", "enabled": False,
+         "hidden": True, "config": {"old": 1}},
+        {"url": "https://new.example/feed.xml", "hidden": False, "config": {}}]})
+    assert r.json() == {"ok": True, "created": 1, "updated": 1, "skipped": 0}
+    src = client.get("/api/sources").json()["sources"][0]
+    assert src["plugin"] == "web" and src["enabled"] is False
+    assert src["hidden"] is False and src["config"] == {}
+
+
+@pytest.mark.asyncio
+async def test_foreign_opml_omitted_name_and_legacy_folder(client):
+    src = client.post("/api/sources", json={"url": "https://a.example/feed.xml",
+        "name": "Keep", "category_name": "Keep"}).json()
+    r = client.post("/api/sources/import.opml", content='''<opml><body>
+      <outline url="https://a.example/feed.xml"/>
+      <outline url="https://b.example/feed.xml"/>
+    </body></opml>''')
+    assert r.json() == {"ok": True, "created": 1, "updated": 1, "skipped": 0}
+    restored = client.get(f'/api/sources/{src["id"]}').json()
+    assert restored["name"] == "Keep" and restored["category_name"] == "Keep"
+    new = next(s for s in client.get("/api/sources").json()["sources"]
+               if s["url"] == "https://b.example/feed.xml")
+    assert new["name"] == new["url"] and new["category_id"] is None
+    assert new["plugin"] == "rss" and new["enabled"] is True and new["hidden"] is False
+    client.post("/api/sources/import.opml", content='''<opml><body>
+      <outline text="Legacy"><outline url="https://a.example/feed.xml"/></outline>
+    </body></opml>''')
+    assert client.get(f'/api/sources/{src["id"]}').json()["category_name"] == "Legacy"
+
+
+@pytest.mark.asyncio
+async def test_import_empty_and_malformed_documents(client):
+    for content in (b"", b"not xml", b"<other><body/></other>", b"<opml/>",
+                    b'<opml><body><outline url="https://a.example/"/></body>'):
+        assert client.post("/api/sources/import.opml", content=content).status_code == 422
+    for data in ({}, {"sources": [{}]}, {"sources": "bad"}):
+        assert client.post("/api/sources/import", json=data).status_code == 422
+    assert client.post("/api/sources/import", content="{").status_code == 422
+    for path, kwargs in (("/api/sources/import", {"json": {"sources": []}}),
+                         ("/api/sources/import.opml", {"content": "<opml><body/></opml>"})):
+        assert client.post(path, **kwargs).json() == {
+            "ok": True, "created": 0, "updated": 0, "skipped": 0}
+    assert client.get("/api/sources").json()["sources"] == []
+
+
+@pytest.mark.asyncio
+async def test_opml_skipped_duplicate_does_not_suppress_new_name(client):
+    r = client.post("/api/sources/import.opml", content='''<opml><body>
+      <outline url="https://example.org/feed.xml" plugin="unknown"/>
+      <outline url="https://example.org/feed.xml"/>
+    </body></opml>''')
+    assert r.json() == {"ok": True, "created": 1, "updated": 0, "skipped": 1}
+    source = client.get("/api/sources").json()["sources"][0]
+    assert source["name"] == source["url"]
+
+
+def test_opml_unsupported_encoding_is_validation_error(client):
+    r = client.post("/api/sources/import.opml", content=(
+        b'<?xml version="1.0" encoding="NOT-A-CODEC"?><opml><body/></opml>'))
+    assert r.status_code == 422

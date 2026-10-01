@@ -13,12 +13,13 @@ from crawler.base import FetchError
 from crawler.pool import shutdown_parse_pool
 from fastapi import FastAPI, HTTPException, Query, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from config import settings
-from fetcher import Fetcher, RefreshBusy
+from newsreader.config import settings
+from newsreader.fetcher import Fetcher, RefreshBusy
+from newsreader.opml import export_opml, parse_opml
 from models.database import Database
 
 log = logging.getLogger("newsreader.api")
@@ -312,42 +313,89 @@ async def export_sources(db: Database = Depends(get_db)):
     }
 
 
-@app.post("/api/sources/import")
-async def import_sources(body: ImportIn, db: Database = Depends(get_db)):
-    """Import sources from an export document. Existing URLs are updated."""
+@app.get("/api/sources/export.opml")
+async def export_sources_opml(db: Database = Depends(get_db)):
+    """Source definitions as OPML; custom metadata may be ignored by other readers."""
+    xml = export_opml(await db.list_sources())
+    return Response(xml, media_type="application/xml",
+                    headers={"Content-Disposition":
+                             'attachment; filename="newsreader-sources.opml"'})
+
+
+async def _import_source_rows(db: Database, rows: list[dict], *, use_url_name: bool = False) -> dict:
+    """Merge import rows {url, name, plugin, category, enabled, hidden, config}.
+
+    Existing URLs update only supplied settings. Unknown explicit plugins and
+    rows no plugin can handle are skipped before creating categories.
+    """
     cat_cache: dict[str, int] = {}
     created = updated = skipped = 0
     all_sources = await db.list_sources()
     by_url = {s["url"]: s for s in all_sources}
-    for imp in body.sources:
+    for row in rows:
         try:
-            url = _normalize_url(imp.url)
+            url = _normalize_url(row.get("url") or "")
         except HTTPException:
             skipped += 1
             continue
-        category_id = None
-        if imp.category:
-            category_id = cat_cache.get(imp.category.lower())
-            if category_id is None:
-                cat = await db.create_category(imp.category)
-                category_id = cat["id"]
-                cat_cache[imp.category.lower()] = category_id
         existing = by_url.get(url)
+        plugin = None
+        if "plugin" in row:
+            plugin = crawler.plugin_by_name(row["plugin"])
+            if plugin is None:
+                skipped += 1
+                continue
+        elif not existing:
+            plugin = crawler.find_plugin(url)
+            if plugin is None:
+                skipped += 1
+                continue
+        fields = {key: row[key] for key in ("name", "enabled", "hidden", "config")
+                  if key in row}
+        if plugin is not None:
+            fields["plugin"] = plugin.name
+        category_id = None
+        if row.get("category"):
+            category_id = cat_cache.get(row["category"].lower())
+            if category_id is None:
+                cat = await db.create_category(row["category"])
+                category_id = cat["id"]
+                cat_cache[row["category"].lower()] = category_id
+        if "category" in row:
+            fields["category_id"] = category_id
         if existing:
-            await db.update_source(existing["id"], name=imp.name, category_id=category_id,
-                                   enabled=imp.enabled, hidden=imp.hidden, config=imp.config)
+            await db.update_source(existing["id"], **fields)
             updated += 1
             continue
-        plugin = crawler.find_plugin(url)
-        if plugin is None and imp.plugin:
-            plugin = crawler.plugin_by_name(imp.plugin)
-        if plugin is None:
-            skipped += 1
-            continue
-        await db.create_source(url=url, name=imp.name, plugin=plugin.name,
-                               category_id=category_id, config=imp.config)
+        source_id = await db.create_source(url=url, name=row.get("name", url if use_url_name else ""),
+                                           plugin=plugin.name,
+                                           category_id=category_id,
+                                            config=row.get("config") or {})
+        flags = {key: row[key] for key in ("enabled", "hidden") if key in row}
+        if flags:
+            await db.update_source(source_id, **flags)
+        by_url[url] = {"id": source_id}
         created += 1
     return {"ok": True, "created": created, "updated": updated, "skipped": skipped}
+
+
+@app.post("/api/sources/import")
+async def import_sources(body: ImportIn, db: Database = Depends(get_db)):
+    """Import sources from an export document. Existing URLs are updated."""
+    rows = [imp.model_dump(exclude_unset=True) for imp in body.sources]
+    return await _import_source_rows(db, rows)
+
+
+@app.post("/api/sources/import.opml")
+async def import_sources_opml(request: Request, db: Database = Depends(get_db)):
+    """Import sources from an OPML document (raw XML body). Existing URLs are updated."""
+    try:
+        parsed = parse_opml(await request.body())
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+    rows = [{"url": s.url, **{key: getattr(s, key) for key in s.supplied_fields}}
+            for s in parsed]
+    return await _import_source_rows(db, rows, use_url_name=True)
 
 
 @app.get("/api/sources/{source_id}")

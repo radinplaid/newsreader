@@ -19,7 +19,7 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import aiosqlite
 
-from config import settings
+from newsreader.config import settings
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS categories (
@@ -536,9 +536,9 @@ class Database:
         inserted_ids = [id_by_guid[r[1]] for r in rows if r[1] not in existing]
         return (inserted, updated, inserted_ids)
 
-    # full row (detail view); the list query omits extra/content to stay slim
+    # full row (detail view); the list query omits content to stay slim
     _SELECT = f"SELECT {_ITEM_COLS}, i.extra, i.content {_ITEM_FROM}"
-    _SELECT_LIST = f"SELECT {_ITEM_COLS} {_ITEM_FROM}"
+    _SELECT_LIST = f"SELECT {_ITEM_COLS}, i.extra {_ITEM_FROM}"
 
     @staticmethod
     def _filter_items(q: str | None = None, source_id: int | None = None,
@@ -646,9 +646,8 @@ class Database:
         for r in rows:
             d = dict(r)
             d["tags"] = json.loads(d["tags"] or "[]")
+            d["extra"] = json.loads(d["extra"] or "{}")
             d["starred"] = bool(d["starred"])
-            if include_content:
-                d["extra"] = json.loads(d["extra"] or "{}")
             items.append(d)
         return items, total
 

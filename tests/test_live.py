@@ -9,7 +9,7 @@ import pytest
 
 import crawler
 from crawler.base import FetchContext
-from fetcher import USER_AGENT
+from newsreader.fetcher import USER_AGENT
 
 REQUIRED_SOURCES = [
     ("https://www.aisi.gov.uk/blog", "web", 10),
@@ -24,9 +24,10 @@ REQUIRED_SOURCES = [
 ]
 
 
-def _fetch(url):
+def _fetch(url, config=None):
     crawler.discover()
     plugin = crawler.find_plugin(url)
+    cfg = {**plugin.default_config(), **(config or {})}
 
     async def go():
         async with httpx.AsyncClient(timeout=60, follow_redirects=True,
@@ -35,7 +36,7 @@ def _fetch(url):
             ctx = FetchContext(source={"id": 0, "url": url, "name": "", "etag": "",
                                        "last_modified": "", "config": {}},
                                client=http, known_dates={},
-                               config=plugin.default_config(),
+                               config=cfg,
                                logger=__import__("logging").getLogger("live"))
             result = await plugin.fetch(ctx)
         return result
@@ -76,3 +77,21 @@ def test_guardian_feed_items_rich():
     assert result.source_name
     assert all(i.published_at for i in result.items)
     assert sum(1 for i in result.items if i.content) >= len(result.items) / 2
+
+
+@pytest.mark.live
+def test_reddit_top_week_min_score():
+    plugin, result = _fetch(
+        "https://www.reddit.com/r/ottawa/top/?screen_view_count=6&t=week",
+        config={"min_score": 100, "page_delay": 0})
+    assert plugin.name == "reddit"
+    assert result.source_name == "r/ottawa · top · week"
+    assert result.items, "no r/ottawa post made 100+ upvotes this week"
+    for item in result.items:
+        assert item.extra["score"] >= 100
+        assert item.title.strip()
+        assert item.url.startswith("https://www.reddit.com/r/")
+        assert item.published_at is not None
+    for item in (i for i in result.items if i.extra.get("external")):
+        assert item.extra.get("link_url", "").startswith("http")
+        assert item.extra["link_url"].split("?")[0] in item.content

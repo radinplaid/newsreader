@@ -3,13 +3,13 @@ import os
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+_PKG_DIR = os.path.dirname(os.path.abspath(__file__))
+_ROOT_DIR = os.path.dirname(_PKG_DIR)
+
+
 class Settings(BaseSettings):
-    nr_db_path: str = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "data", "newsreader.db"
-    )
-    nr_web_dir: str = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "web"
-    )
+    nr_db_path: str = os.path.join(_ROOT_DIR, "data", "newsreader.db")
+    nr_web_dir: str = os.path.join(_ROOT_DIR, "web")
     nr_refresh_interval_min: float = 0.0
     nr_min_refresh_minutes: float = 15.0
     nr_max_concurrency: int = 24

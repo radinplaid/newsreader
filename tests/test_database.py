@@ -77,8 +77,10 @@ async def test_upsert_counts_and_merge(db):
     await db.upsert_items(sid, items2)
     lst, total = await db.list_items(source_id=sid)
     assert total == 2
-    # list responses stay slim: full content only comes from the detail query
-    assert all("content" not in i and "extra" not in i for i in lst)
+    # list responses stay slim: full content only comes from the detail query,
+    # but extra (score & friends) rides along for the list cards
+    assert all("content" not in i for i in lst)
+    assert all(i["extra"] == {} for i in lst)
     g1 = await db.get_item(next(i["id"] for i in lst if i["guid"] == "g1"))
     assert g1["content"] == "longer content than before"
     assert g1["published_at"] == pytest.approx(now - 10)
@@ -586,3 +588,14 @@ async def test_migrate_backfills_read_at(db):
     # new items, though, arrive unread
     await db.upsert_items(sid, [_item("g3", published_at=time.time())])
     assert (await db.list_items(unread=True))[1] == 1
+
+
+@pytest.mark.asyncio
+async def test_list_items_carries_extra_for_cards(db):
+    sid = await db.create_source("https://reddit.com/r/x", "r/x", "reddit")
+    await db.upsert_items(sid, [_item("t3_a", extra={"kind": "reddit", "score": 250})])
+    items, _ = await db.list_items(source_id=sid)
+    assert items[0]["extra"] == {"kind": "reddit", "score": 250}
+    full, _ = await db.list_items(source_id=sid, include_content=True)
+    assert full[0]["extra"]["score"] == 250
+    assert "content" in full[0]

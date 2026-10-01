@@ -6,9 +6,9 @@ serverless HTML5 web client (plain static files — no build step, no framework)
 ## Features
 
 * **Plug-in architecture for sources** — RSS/Atom, YouTube playlists/channels,
-  arXiv searches, and a generic blog/news listing scraper ship in the box.
-  New source types are single-file plugins that are discovered automatically
-  (see [Adding a plugin](#adding-a-plugin)).
+  arXiv searches, Reddit subreddits, and a generic blog/news listing scraper
+  ship in the box. New source types are single-file plugins that are discovered
+  automatically (see [Adding a plugin](#adding-a-plugin)).
 * **Many sources, parallel downloads** — every refresh runs all enabled
   sources concurrently (bounded semaphore, default 24 parallel fetches),
   with ETag/Last-Modified conditional requests so unchanged feeds are nearly free.
@@ -166,13 +166,15 @@ best plugin by URL, and refreshes run through the shared parallel fetcher.
 ```
 web/            static HTML5 client (vanilla JS/CSS, works from any static host)
 api/            FastAPI app: JSON API under /api, serves web/ at /
-fetcher.py      parallel refresh orchestrator (semaphore-bounded, per-source isolation)
+newsreader/     core package: config.py (settings) · fetcher.py (parallel refresh
+                orchestrator, semaphore-bounded, per-source isolation) ·
+                opml.py (OPML 2.0 import/export)
 crawler/
   base.py       Plugin, FetchContext, FetchResult, ParsedItem
   pool.py       process pool for CPU-bound parsing (GIL-free, thread fallback)
   __init__.py   plugin registry + auto-discovery
   textutil.py   date parsing, cleaning, image extraction helpers
-  plugins/      rss.py · web.py · youtube.py · arxiv.py (drop more files here)
+  plugins/      rss.py · web.py · youtube.py · arxiv.py · reddit.py (drop more files here)
 models/
   database.py   SQLite schema + repository (WAL, FTS5, tags, categories)
 scripts/        seed_sources.py · check_sources.py
@@ -210,6 +212,8 @@ PATCH  /api/sources/{id}               {"name"?, "category_id"?, "enabled"?, "hi
 DELETE /api/sources/{id}
 GET    /api/sources/export             portable JSON of all sources (no articles)
 POST   /api/sources/import             {"sources": [...]} from an export document
+GET    /api/sources/export.opml        OPML 2.0 of all sources (feed-reader compatible)
+POST   /api/sources/import.opml        raw OPML body; same match-by-URL semantics
 GET    /api/categories
 POST   /api/categories                 {"name"}
 PATCH  /api/categories/{id}            {"name"}
@@ -226,13 +230,27 @@ and pointed at a running server — the client is purely static.
 
 ## Sharing sources
 
-The sidebar footer has **Export** / **Import** buttons. Export downloads a
-JSON document with every source's url, name, plugin, category, enabled/hidden
-state and per-source config — no articles. Send the file to someone else and
-they can import it: sources are matched by URL, so re-importing updates
-existing entries in place rather than duplicating them. The same round-trip
-works over the API via `GET /api/sources/export` and
-`POST /api/sources/import`.
+The topbar **Sources** button opens the source transfer dialog. **Export sources**
+downloads OPML with source URLs, names, types, categories, enabled/hidden state,
+and configuration. **Import sources…** accepts OPML/XML or older JSON exports
+automatically, without a format selector. Confirm inside the dialog before
+importing; results show how many sources were added, updated, or skipped.
+
+Sources match by normalized URL. Matching sources update only settings supplied
+in the file; omitted settings remain unchanged, so basic OPML files do not erase
+scraper options or disabled/hidden state. Supplied configuration replaces the
+whole configuration dictionary. Articles and read/starred state are not included
+or changed: this is source transfer, not a full database backup.
+
+OPML custom attributes preserve all five Newsreader source types and their
+settings between Newsreader installations. Categories also appear as folder
+outlines. Other readers may discard custom metadata or not support YouTube,
+Reddit, arXiv, or web sources. Share exports carefully: source URLs and settings
+may contain private information.
+
+The API remains available through `GET /api/sources/export.opml` and
+`POST /api/sources/import.opml` (raw XML body). Legacy JSON endpoints
+`GET /api/sources/export` and `POST /api/sources/import` remain supported.
 
 ## Configuration (environment variables)
 
@@ -251,7 +269,18 @@ works over the API via `GET /api/sources/export` and
 Per-source knobs live in `source.config` (merged with plugin defaults), e.g.
 `{"max_items": 500, "fetch_content": true, "content_fetch_limit": 12}` for web
 sources, `{"fetch_video_dates": true, "date_fetch_limit": 60}` for YouTube,
-`{"max_results": 200}` for arXiv. Paginated scrapers stop following pages
+`{"max_results": 200}` for arXiv. Reddit sources get a dedicated dialog (add
+and edit) with subreddit, sort, time window and a required **minimum score** —
+posts below it are never added, `external_only` keeps just link posts; the
+dialog composes the listing URL with the right query parameters itself
+(`top` defaults to the past week even when pasted bare). Reddit items always
+link to their thread — the card title and “Open on Reddit” open the reddit
+post, the outbound article link sits at the top of the detail view — image,
+gallery and video posts embed their media there and carry a thumbnail plus
+the post score on the list cards. Reddit is read through its public `.json`
+listings with no API keys; when Reddit gates logged-out access from a network
+with its JS verification page, the plugin solves it and retries automatically.
+Paginated scrapers stop following pages
 once a page reaches items already in the DB (`"stop_on_known": false` opts
 out); YouTube stops its per-video date fetches after
 `"date_fetch_max_errors"` failures per refresh and remembers bot-check /
@@ -282,4 +311,5 @@ members-only failures in `date_fetch_skip` for 3 days.
 ```bash
 python -m pytest            # offline unit tests (db, parsers, API)
 python -m pytest -m live    # live tests against the real sources
+node --test tests/source_transfer.test.cjs  # source transfer UI logic (requires Node.js)
 ```
