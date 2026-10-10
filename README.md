@@ -18,8 +18,9 @@ serverless HTML5 web client (plain static files — no build step, no framework)
   shows a persistent notification (no timeout; dismissed manually) naming the
   source. The HTTP status, URL and a response excerpt are included for
   debugging, collapsed behind a "Details" toggle by default. The sidebar
-  marks failing sources with a ⚠ badge, and a refresh summary toast counts
-  the failures.
+  marks failing sources with a red ⚠ badge (hover for the failure count and
+  last error); enabled sources with no successful refresh in 3+ days get an
+  amber ⚠. A refresh summary toast counts the failures.
 * **Reliable dates** — dates are parsed from feeds, listing cards (`<time>`,
   meta tags, text patterns) and article pages. Items still missing a date are
   backfilled by scraping the article page / video info, bounded per refresh
@@ -47,6 +48,11 @@ serverless HTML5 web client (plain static files — no build step, no framework)
   sidebar becomes off-canvas. Dark/light theme, comfortable/compact list
   density, infinite scroll, search-term highlighting, per-article tag editor,
   and prefetching of the next/previous article so navigation is instant.
+  Sources nest under their category in the sidebar (expand/collapse with the
+  chevron; feeds without a category are grouped under “Uncategorized”). The
+  list/reader divider can be dragged to resize (double-click resets it).
+  Hover actions (open, copy, star, dismiss) appear over the article thumbnail,
+  and long tag names truncate with the full name on hover.
   YouTube items (and YouTube links inside article bodies) render as
   click-to-load facades — thumbnail + play button, with a youtube-nocookie
   iframe appearing only on tap.
@@ -65,8 +71,8 @@ serverless HTML5 web client (plain static files — no build step, no framework)
   A firehose like arXiv + the Guardian stays readable on a daily cadence.
 * **Keyboard-driven** — `j`/`k` (or `↑`/`↓`/`←`/`→`) walk the list, `Enter`/`o`
   opens the original, `s` stars, `u` toggles read, `d` dismisses (undoable),
-  `c` copies the link, `/` searches, `r` refreshes, `t` toggles the theme,
-  `?` shows the shortcut sheet. On touch screens the same walk is a
+  `c` copies the link, `b` shows/hides the sidebar, `/` searches, `r`
+  refreshes, `t` toggles the theme, `?` shows the shortcut sheet. On touch screens the same walk is a
   left/right swipe on the open article, and list rows swipe left/right to
   dismiss/star (edge swipes stay with the browser's back gesture). Filters
   and the open article are reflected in the URL hash (shareable,
@@ -230,7 +236,12 @@ and pointed at a running server — the client is purely static.
 
 ## Sharing sources
 
-The topbar **Sources** button opens the source transfer dialog. **Export sources**
+The topbar **Sources** button opens the source manager: a filterable list of
+every source showing its category, plugin, status (paused, failing, last
+successful refresh) and article count. Each row can be refreshed, paused,
+hidden from the feed, or edited; **+ Add source** opens the add dialog.
+Import and export live in the collapsed **Import & export** section at the
+bottom of the same dialog. **Export sources**
 downloads OPML with source URLs, names, types, categories, enabled/hidden state,
 and configuration. **Import sources…** accepts OPML/XML or older JSON exports
 automatically, without a format selector. Confirm inside the dialog before
@@ -312,4 +323,5 @@ members-only failures in `date_fetch_skip` for 3 days.
 python -m pytest            # offline unit tests (db, parsers, API)
 python -m pytest -m live    # live tests against the real sources
 node --test tests/source_transfer.test.cjs  # source transfer UI logic (requires Node.js)
+node --test tests/source_health.test.cjs    # sidebar source health rules (requires Node.js)
 ```

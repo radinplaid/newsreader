@@ -15,7 +15,7 @@ function setup() {
         classList: { add: (c) => classes.add(c), remove: (c) => classes.delete(c),
           toggle: (c, on) => on ? classes.add(c) : classes.delete(c), contains: (c) => classes.has(c) },
         addEventListener(event, fn) { this.handlers[event] = fn; },
-        setAttribute() {}, focus() { this.focused = true; },
+        setAttribute() {}, replaceChildren() {}, focus() { this.focused = true; },
         showModal() { this.open = true; },
         close() { this.open = false; this.handlers.close(); }, click() {},
       });
@@ -25,8 +25,10 @@ function setup() {
   const context = vm.createContext({ $, Blob, URL, Date,
     api: async (path, options) => { calls.push({ path, options }); return { created: 1, updated: 2, skipped: 3 }; },
     loadSidebar: async () => calls.push('sidebar'), loadItems: async () => calls.push('items'),
+    state: { sources: [] }, icon: () => ({}), timeago: () => '', pollRefresh: () => {},
+    openEditDialog: () => {},
     fetch: async () => ({ ok: true, text: async () => '<opml/>' }),
-    el: (_tag, attrs) => { calls.push(attrs); return { ...attrs, click() {} }; },
+    el: (_tag, attrs) => { if (attrs && 'download' in attrs) calls.push(attrs); return { ...attrs, click() {} }; },
   });
   const code = readFileSync(join(__dirname, '../web/app.js'), 'utf8');
   vm.runInContext(code.slice(code.indexOf('/* ---------------- source transfer dialog'),

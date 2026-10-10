@@ -389,8 +389,8 @@ async function loadSidebar() {
 function renderSidebar() {
   renderNav();
   renderCategories();
-  renderSources();
   renderTags();
+  if ($("#sourcesDialog").open) renderSourcesManager();
 }
 
 /* ---------------- rendering: sidebar ---------------- */
@@ -432,6 +432,34 @@ function renderNav() {
     el("span", { class: "count" }, String(state.starredCount))));
 }
 
+// Sources nest under their category. `null` is the Uncategorized group.
+const expandedGroups = new Set(JSON.parse(localStorage.getItem("nr-expanded") || "[]"));
+const closedGroups = new Set();  // collapsed by hand while holding the active view
+const groupKey = (catId) => (catId === null ? "none" : String(catId));
+function isGroupExpanded(catId) {
+  const key = groupKey(catId);
+  if (closedGroups.has(key)) return false;
+  if (expandedGroups.has(key)) return true;
+  // always show the group holding the active source/category
+  if (state.sourceId !== null) {
+    const src = state.sources.find((s) => s.id === state.sourceId);
+    if (src && (src.category_id ?? null) === catId) return true;
+  }
+  return state.categoryId !== null && state.categoryId === catId;
+}
+function toggleGroup(catId) {
+  const key = groupKey(catId);
+  if (isGroupExpanded(catId)) {
+    expandedGroups.delete(key);
+    closedGroups.add(key);
+  } else {
+    closedGroups.delete(key);
+    expandedGroups.add(key);
+  }
+  localStorage.setItem("nr-expanded", JSON.stringify([...expandedGroups]));
+  renderCategories();
+}
+
 function renderCategories() {
   const list = $("#catList");
   list.replaceChildren();
@@ -463,15 +491,40 @@ function renderCategories() {
           } catch (err) { toast(err.message, true); }
         },
       }, icon("x")));
+    const expandable = state.sources.some((s) => s.category_id === cat.id);
+    const open = isGroupExpanded(cat.id);
     const li = el("li", {
       class: state.categoryId === cat.id ? "active" : "",
       onclick: () => setView({ categoryId: cat.id, sourceId: null }),
     },
+      expandable
+        ? el("span", {
+          class: "chev" + (open ? " open" : ""),
+          title: open ? "Hide sources" : "Show sources",
+          "aria-label": open ? "Hide sources" : "Show sources",
+          onclick: (ev) => { ev.stopPropagation(); toggleGroup(cat.id); },
+        }, icon("chevron"))
+        : el("span", { class: "chev-spacer" }),
       el("span", { class: "dot", style: `background:${catColor(cat.id)}` }),
       el("span", { class: "src-title" }, cat.name),
       actions,
       sideBadge(cat.unread_count, cat.item_count));
     list.append(li);
+    if (open) for (const src of state.sources) if (src.category_id === cat.id) list.append(sourceRow(src));
+  }
+  const loose = state.sources.filter((s) => !s.category_id);
+  if (loose.length) {
+    const open = isGroupExpanded(null);
+    list.append(el("li", {
+      class: "uncat",
+      onclick: () => toggleGroup(null),
+    },
+      el("span", { class: "chev" + (open ? " open" : ""), "aria-label": "Toggle uncategorized sources" },
+        icon("chevron")),
+      el("span", { class: "src-title" }, "Uncategorized"),
+      sideBadge(loose.reduce((n, s) => n + s.unread_count, 0),
+        loose.reduce((n, s) => n + s.item_count, 0))));
+    if (open) for (const src of loose) list.append(sourceRow(src));
   }
   // fill add-source select
   const sel = $("#addCatSel");
@@ -481,18 +534,26 @@ function renderCategories() {
   }
 }
 
-function renderSources() {
-  const list = $("#srcList");
-  list.replaceChildren();
-  const grouped = new Map();
-  for (const src of state.sources) {
-    const key = src.category_name || "Uncategorized";
-    if (!grouped.has(key)) grouped.set(key, []);
-    grouped.get(key).push(src);
+// Health summary for a source: null when healthy, else { level, text }.
+const STALE_AFTER_S = 3 * 24 * 3600;
+function sourceHealth(src) {
+  if (src.error_streak > 0 || src.last_status === "error") {
+    const n = src.error_streak || 1;
+    return {
+      level: "fail",
+      text: `Failing (${n} failed ${n === 1 ? "attempt" : "attempts"})` +
+        (src.last_error ? `: ${src.last_error}` : ""),
+    };
   }
-  for (const [group, srcs] of grouped) {
-    list.append(el("li", { class: "side-group" }, group));
-    for (const src of srcs) {
+  const last = src.last_refreshed_at;
+  if (src.enabled && !src.hidden && last &&
+      Date.now() / 1000 - last > STALE_AFTER_S) {
+    return { level: "stale", text: "No successful refresh in 3+ days" };
+  }
+  return null;
+}
+
+function sourceRow(src) {
       const actions = el("span", { class: "src-actions" });
       actions.append(el("span", {
         class: "mini-btn",
@@ -543,9 +604,12 @@ function renderSources() {
           openEditDialog(src);
         },
       }, icon("pencil")));
+      const health = sourceHealth(src);
+      const tip = [src.name || src.url, src.url];
+      if (health) tip.push(health.text);
       const li = el("li", {
-        class: (state.sourceId === src.id ? "active" : "") + (src.hidden ? " muted" : ""),
-        title: src.last_error ? `Last error: ${src.last_error}` : src.url,
+        class: "nested " + (state.sourceId === src.id ? "active" : "") + (src.hidden ? " muted" : ""),
+        title: tip.join("\n"),
         onclick: () => setView({ sourceId: src.id, categoryId: null }),
       },
         el("span", {
@@ -553,13 +617,12 @@ function renderSources() {
           style: `background:${src.hidden ? "#555" : src.enabled ? catColor(src.id) : "#555"}`,
         }),
         el("span", { class: "src-title" }, src.name || src.url),
-        src.last_status === "error"
-          ? el("span", { class: "err", title: src.last_error }, icon("alert")) : null,
+        health
+          ? el("span", { class: `err ${health.level}`, title: health.text }, icon("alert"))
+          : null,
         actions,
         sideBadge(src.unread_count, src.item_count));
-      list.append(li);
-    }
-  }
+      return li;
 }
 
 function renderTags() {
@@ -589,7 +652,7 @@ function renderTags() {
     type: "button",
     title: `Filter by tag “${t.name}”`,
     onclick: () => setView({ tag: state.tag === t.name ? null : t.name }),
-  }, t.name, el("span", { class: "count" }, String(t.item_count)));
+  }, el("span", { class: "chip-name" }, t.name), el("span", { class: "count" }, String(t.item_count)));
   for (const t of visible) cloud.append(chipFor(t));
 
   if (state.showAllTags) {
@@ -777,6 +840,8 @@ function renderItems(items, opts = {}) {
       thumbBox.append(el("span", { class: "play-badge", "aria-hidden": "true" },
         icon("play")));
     }
+    // actions sit over the thumbnail on hover, so they never cover the title
+    thumbBox.append(rowActions(item));
     const titleLink = el("a", {
       class: "title-link", href: item.url, target: "_blank", rel: "noopener noreferrer",
       onclick: (ev) => ev.stopPropagation(),
@@ -799,7 +864,8 @@ function renderItems(items, opts = {}) {
         selectItem(item.id);
       },
       onkeydown: (ev) => {
-        if (ev.key === "Enter") {
+        // Enter on the already-open row falls through to the global handler (open original)
+        if (ev.key === "Enter" && !(state.selected && state.selected.id === item.id)) {
           ev.preventDefault();
           ev.stopPropagation();
           selectItem(item.id);
@@ -828,7 +894,7 @@ function renderItems(items, opts = {}) {
           }, t)),
           item.tags.length > 4 ? el("span", { class: "chip" }, `+${item.tags.length - 4}`) : null
         ) : null),
-      rowActions(item));
+      );
     frag.append(row);
   }
   if (opts.prepend) list.prepend(frag);
@@ -1775,6 +1841,7 @@ document.addEventListener("keydown", (ev) => {
   if (k === "k" || k === "ArrowUp" || k === "ArrowLeft") { ev.preventDefault(); moveSelection(-1); return; }
   if (k === "r") { ev.preventDefault(); startRefresh(); return; }
   if (k === "t") { ev.preventDefault(); toggleTheme(); return; }
+  if (k === "b") { ev.preventDefault(); toggleSidebar(); return; }
   if (!state.selected) return;
   const item = state.selected;
   if (k === "Enter" || k === "o") {
@@ -1973,9 +2040,90 @@ function clearPendingImport() {
   $("#importConfirmation").classList.add("hidden");
 }
 
+/* ---- manage sources: list, filter and per-row actions ---- */
+function sourceStatus(src) {
+  if (!src.enabled) return { text: "Paused", cls: "" };
+  if (src.error_streak > 0 || src.last_status === "error") {
+    return { text: `Failing (${src.error_streak || 1})`, cls: "fail", title: src.last_error || "" };
+  }
+  if (!src.last_refreshed_at) return { text: "Never refreshed", cls: "" };
+  return { text: `OK · ${timeago(src.last_refreshed_at)}`, cls: "ok" };
+}
+
+async function patchSource(src, body, message) {
+  try {
+    await api(`/sources/${src.id}`, { method: "PATCH", body: JSON.stringify(body),
+      headers: { "Content-Type": "application/json" } });
+    if (message) toast(message);
+    await loadSidebar();
+  } catch (err) { toast(err.message, true); }
+}
+
+function sourceManagerRow(src) {
+  const label = src.name || src.url;
+  const status = sourceStatus(src);
+  const btn = (iconName, title, onclick) => el("button", {
+    type: "button", class: "mini-btn", title, "aria-label": title, onclick,
+  }, icon(iconName));
+  return el("div", { class: "sm-row" + (src.enabled ? "" : " paused") + (src.hidden ? " hidden-src" : ""),
+    role: "listitem" },
+    el("div", { class: "sm-main" },
+      el("div", { class: "sm-name" }, label),
+      el("div", { class: "sm-url", title: src.url }, src.url)),
+    el("span", { class: "sm-cat" }, src.category_name || "Uncategorized"),
+    el("span", { class: "sm-plugin" }, src.plugin || ""),
+    el("span", { class: `sm-status ${status.cls}`, title: status.title || status.text }, status.text),
+    el("span", { class: "sm-count", title: "Articles" }, String(src.item_count)),
+    el("div", { class: "sm-actions" },
+      btn("refresh", "Refresh this source", async () => {
+        try {
+          await api("/refresh", { method: "POST",
+            body: JSON.stringify({ source_id: src.id, force: true }),
+            headers: { "Content-Type": "application/json" } });
+          toast(`Refreshing ${label}…`);
+          pollRefresh();
+        } catch (err) { toast(err.message, true); }
+      }),
+      btn(src.enabled ? "pause" : "play", src.enabled ? "Pause source" : "Resume source",
+        () => patchSource(src, { enabled: !src.enabled })),
+      btn(src.hidden ? "eyeOff" : "eye", src.hidden ? "Show in feed" : "Hide from feed",
+        () => patchSource(src, { hidden: !src.hidden })),
+      btn("pencil", "Edit source", () => {
+        sourcesDialog.close();
+        openEditDialog(src);
+      })));
+}
+
+function renderSourcesManager() {
+  const needle = $("#sourcesFilter").value.trim().toLowerCase();
+  const all = [...state.sources].sort((a, b) =>
+    (a.category_name || "~").localeCompare(b.category_name || "~") ||
+    (a.name || a.url).localeCompare(b.name || b.url));
+  const shown = needle
+    ? all.filter((s) => [s.name, s.url, s.category_name, s.plugin]
+      .some((v) => (v || "").toLowerCase().includes(needle)))
+    : all;
+  $("#sourcesCount").textContent = needle
+    ? `${shown.length} of ${all.length}` : `${all.length} source${all.length === 1 ? "" : "s"}`;
+  const list = $("#sourcesManageList");
+  if (!shown.length) {
+    list.replaceChildren(el("p", { class: "sm-empty" },
+      all.length ? "No sources match this filter." : "No sources yet. Add one to get started."));
+    return;
+  }
+  list.replaceChildren(...shown.map(sourceManagerRow));
+}
+
+$("#sourcesFilter").addEventListener("input", renderSourcesManager);
+$("#sourcesAdd").addEventListener("click", () => {
+  sourcesDialog.close();
+  $("#addDialog").showModal();
+});
+
 $("#ioBtn").addEventListener("click", () => {
   clearPendingImport();
   transferStatus("");
+  renderSourcesManager();
   sourcesDialog.showModal();
 });
 $("#sourcesClose").addEventListener("click", () => sourcesDialog.close());
@@ -2192,9 +2340,80 @@ function closeSidebar() {
   $("#sidebar").classList.remove("open");
   $("#scrim").classList.remove("show");
 }
-$("#menuBtn").addEventListener("click", () => {
-  $("#sidebar").classList.contains("open") ? closeSidebar() : openSidebar();
+const wideLayout = window.matchMedia("(min-width: 901px)");
+function applySidebarPref() {
+  // desktop: collapsed state persists; mobile uses the slide-over instead
+  $("#sidebar").classList.toggle("collapsed",
+    wideLayout.matches && localStorage.getItem("nr-sidebar") === "hidden");
+}
+function toggleSidebar() {
+  if (wideLayout.matches) {
+    const hide = !$("#sidebar").classList.contains("collapsed");
+    localStorage.setItem("nr-sidebar", hide ? "hidden" : "shown");
+    applySidebarPref();
+  } else {
+    $("#sidebar").classList.contains("open") ? closeSidebar() : openSidebar();
+  }
+}
+$("#menuBtn").addEventListener("click", toggleSidebar);
+wideLayout.addEventListener("change", applySidebarPref);
+applySidebarPref();
+
+/* ---------------- resizable list / reader split ---------------- */
+const LIST_DEFAULT = 412, LIST_MIN = 320, READER_MIN = 420;
+function clampListWidth(px) {
+  const room = $(".shell").clientWidth - $("#sidebar").offsetWidth - 8 - READER_MIN;
+  return Math.round(Math.max(LIST_MIN, Math.min(px, Math.max(LIST_MIN, room))));
+}
+function setListWidth(px, save = true) {
+  const w = clampListWidth(px);
+  document.documentElement.style.setProperty("--list-w", `${w}px`);
+  $("#paneSplit").setAttribute("aria-valuenow", String(w));
+  if (save) localStorage.setItem("nr-list-w", String(w));
+  return w;
+}
+function resetListWidth() {
+  localStorage.removeItem("nr-list-w");
+  document.documentElement.style.removeProperty("--list-w");
+  $("#paneSplit").setAttribute("aria-valuenow", String(LIST_DEFAULT));
+}
+const savedListW = Number(localStorage.getItem("nr-list-w"));
+if (savedListW) setListWidth(savedListW, false);
+
+const split = $("#paneSplit");
+split.addEventListener("pointerdown", (ev) => {
+  if (!wideLayout.matches || ev.button !== 0) return;
+  ev.preventDefault();
+  split.setPointerCapture(ev.pointerId);
+  split.classList.add("dragging");
+  document.body.classList.add("resizing");
+  const left = $("#listPane").getBoundingClientRect().left;
+  const move = (e) => setListWidth(e.clientX - left, false);
+  const up = () => {
+    split.removeEventListener("pointermove", move);
+    split.removeEventListener("pointerup", up);
+    split.removeEventListener("pointercancel", up);
+    split.classList.remove("dragging");
+    document.body.classList.remove("resizing");
+    setListWidth(parseFloat(getComputedStyle($("#listPane")).width));
+  };
+  split.addEventListener("pointermove", move);
+  split.addEventListener("pointerup", up);
+  split.addEventListener("pointercancel", up);
 });
+split.addEventListener("dblclick", resetListWidth);
+split.addEventListener("keydown", (ev) => {
+  if (ev.key !== "ArrowLeft" && ev.key !== "ArrowRight") return;
+  ev.preventDefault();
+  const cur = parseFloat(getComputedStyle($("#listPane")).width);
+  setListWidth(cur + (ev.key === "ArrowRight" ? 24 : -24));
+});
+// keep a saved width valid if the window shrinks
+window.addEventListener("resize", () => {
+  if (!wideLayout.matches || !localStorage.getItem("nr-list-w")) return;
+  setListWidth(parseFloat(getComputedStyle($("#listPane")).width));
+});
+
 $("#scrim").addEventListener("click", closeSidebar);
 $("#tagFilter").addEventListener("input", (ev) => {
   state.tagFilter = ev.target.value.trim();

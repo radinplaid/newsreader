@@ -5,6 +5,7 @@ Usage: python scripts/seed_sources.py [--db PATH] [--fresh]
 from __future__ import annotations
 
 import argparse
+import asyncio
 import sys
 from pathlib import Path
 
@@ -37,31 +38,37 @@ SEED = {
 }
 
 
-def main() -> None:
+async def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--db", default=None)
     parser.add_argument("--fresh", action="store_true", help="delete the db first")
     args = parser.parse_args()
 
     db = Database(args.db)
-    if args.fresh:
-        for src in db.list_sources():
-            db.delete_source(src["id"])
-        for cat in db.list_categories():
-            db.delete_category(cat["id"])
+    await db.init()
+    try:
+        if args.fresh:
+            for src in await db.list_sources():
+                await db.delete_source(src["id"])
+            for cat in await db.list_categories():
+                await db.delete_category(cat["id"])
 
-    crawler.discover()
-    for category, sources in SEED.items():
-        cat = db.create_category(category)
-        for url, name in sources:
-            plugin = crawler.find_plugin(url)
-            if plugin is None:
-                print(f"!! no plugin for {url}")
-                continue
-            sid = db.create_source(url, name=name, plugin=plugin.name, category_id=cat["id"])
-            print(f"+ [{category}] {name} -> {plugin.name} (source {sid})")
-    print("sources:", len(db.list_sources()), "categories:", len(db.list_categories()))
+        crawler.discover()
+        for category, sources in SEED.items():
+            cat = await db.create_category(category)
+            for url, name in sources:
+                plugin = crawler.find_plugin(url)
+                if plugin is None:
+                    print(f"!! no plugin for {url}")
+                    continue
+                sid = await db.create_source(url, name=name, plugin=plugin.name,
+                                             category_id=cat["id"])
+                print(f"+ [{category}] {name} -> {plugin.name} (source {sid})")
+        print("sources:", len(await db.list_sources()),
+              "categories:", len(await db.list_categories()))
+    finally:
+        await db.close()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

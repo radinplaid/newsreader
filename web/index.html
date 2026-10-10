@@ -28,7 +28,7 @@
   <div class="topbar-actions">
     <div class="source-actions" role="group" aria-label="Source actions">
       <button id="ioBtn" class="btn ghost sources-btn" aria-haspopup="dialog"
-              aria-controls="sourcesDialog" title="Import / export sources">Sources</button>
+              aria-controls="sourcesDialog" title="Manage sources">Sources</button>
       <button id="addBtn" class="btn primary add-btn" title="Add a news source"><span data-icon="plus"></span><span class="add-label-desktop">Add source</span><span class="add-label-mobile">Source</span></button>
     </div>
     <div class="utility-actions" role="group" aria-label="App utilities">
@@ -52,10 +52,6 @@
           <button class="mini-btn" id="addCatBtn" data-icon="plus" title="Add category" aria-label="Add category"></button>
         </div>
         <ul id="catList" class="side-list"></ul>
-      </section>
-      <section class="side-block">
-        <div class="side-head"><h2>Sources</h2></div>
-        <ul id="srcList" class="side-list"></ul>
       </section>
       <section class="side-block">
         <div class="side-head"><h2>Tags</h2></div>
@@ -109,6 +105,9 @@
     <div id="sentinel" class="sentinel"></div>
     <div id="endNote" class="endnote hidden">That’s everything.</div>
   </main>
+
+  <div id="paneSplit" class="pane-split" role="separator" aria-orientation="vertical"
+       aria-label="Resize article list" aria-valuemin="320" tabindex="0" title="Drag to resize · double-click to reset"></div>
 
   <section class="reader" id="reader" aria-label="Reader">
     <div class="reader-empty" id="readerEmpty">
@@ -280,9 +279,20 @@
 </dialog>
 
 <!-- source transfer dialog -->
-<dialog id="sourcesDialog" class="modal sources-modal" aria-labelledby="sourcesTitle" aria-describedby="sourcesScope">
-  <h3 id="sourcesTitle">Sources</h3>
-  <p id="sourcesScope" class="hint">Move your sources between readers or keep a copy of your setup. Articles and read/starred state are not included.</p>
+<dialog id="sourcesDialog" class="modal sources-modal" aria-labelledby="sourcesTitle">
+  <div class="sm-head">
+    <h3 id="sourcesTitle">Sources</h3>
+    <span id="sourcesCount" class="hint"></span>
+  </div>
+  <div class="sm-toolbar">
+    <input id="sourcesFilter" type="search" placeholder="Filter by name, URL, category or plugin…"
+           autocomplete="off" aria-label="Filter sources">
+    <button type="button" class="btn primary" id="sourcesAdd">+ Add source</button>
+  </div>
+  <div id="sourcesManageList" class="sm-list" role="list"></div>
+  <details class="sm-transfer">
+    <summary>Import &amp; export</summary>
+    <p class="hint" id="sourcesScope">Move your sources between readers or keep a copy of your setup. Articles and read/starred state are not included.</p>
   <section class="source-transfer" aria-labelledby="importTitle">
     <h4 id="importTitle">Bring your sources in</h4>
     <p>Choose an OPML file from another reader or a previous Newsreader export. Older JSON exports work too.</p>
@@ -302,6 +312,7 @@
     <p>Download OPML with your categories and Newsreader source settings. Other readers may ignore custom settings or non-feed sources. Share carefully: exports can contain private URLs and configuration.</p>
     <button type="button" class="btn" id="sourcesExport">Export sources</button>
   </section>
+  </details>
   <p id="sourcesStatus" class="transfer-status" role="status" aria-live="polite" aria-atomic="true"></p>
   <div class="modal-actions">
     <button type="button" class="btn ghost" id="sourcesClose">Close</button>
@@ -336,6 +347,7 @@
         <div><dt><kbd>/</kbd></dt><dd>Focus search</dd></div>
         <div><dt><kbd>r</kbd></dt><dd>Refresh all sources</dd></div>
         <div><dt><kbd>t</kbd></dt><dd>Toggle theme</dd></div>
+        <div><dt><kbd>b</kbd></dt><dd>Show / hide sidebar</dd></div>
         <div><dt><kbd>?</kbd></dt><dd>This dialog</dd></div>
       </dl>
     </div>
