@@ -61,6 +61,10 @@ serverless HTML5 web client (plain static files — no build step, no framework)
   bulk “Mark read” over the current filter. Existing articles are migrated
   as read, so upgrading never presents a backlog. Read state follows the
   database, not the browser.
+* **Read it later** — the bookmark button in the sidebar footer saves any
+  article by URL. It lands unread and starred in “Read it later” by default;
+  pick another category in the dialog and untick either box to change the
+  defaults. Saved articles are ordinary items.
 * **Safe triage** — star, dismiss and read are one tap (or a swipe on list
   rows: left dismisses, right stars). Dismissal is undoable via a toast
   (`DELETE /api/items/{id}/dismiss`), and refreshes never yank the list out
@@ -236,10 +240,10 @@ and pointed at a running server — the client is purely static.
 
 ## Sharing sources
 
-The topbar **Sources** button opens the source manager: a filterable list of
+The sidebar footer's **transfer** button opens the source manager: a filterable list of
 every source showing its category, plugin, status (paused, failing, last
 successful refresh) and article count. Each row can be refreshed, paused,
-hidden from the feed, or edited; **+ Add source** opens the add dialog.
+hidden from the feed, or edited; the **+** button in the footer opens the add dialog.
 Import and export live in the collapsed **Import & export** section at the
 bottom of the same dialog. **Export sources**
 downloads OPML with source URLs, names, types, categories, enabled/hidden state,

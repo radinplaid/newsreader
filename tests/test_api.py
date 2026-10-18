@@ -758,3 +758,60 @@ def test_opml_unsupported_encoding_is_validation_error(client):
     r = client.post("/api/sources/import.opml", content=(
         b'<?xml version="1.0" encoding="NOT-A-CODEC"?><opml><body/></opml>'))
     assert r.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_save_article_defaults_and_options(client, monkeypatch):
+    async def fake_fetch(url):
+        return ({"title": "Saved Title", "summary": "sum", "content": "body text",
+                 "author": "Ann", "published_at": None, "image_url": ""}, url)
+    monkeypatch.setattr(app_module, "_fetch_article", fake_fetch)
+
+    r = client.post("/api/saved", json={"url": "https://example.com/post/?utm_source=x"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    item = body["item"]
+    assert body["fetched"] is True
+    assert item["title"] == "Saved Title"
+    assert item["url"] == "https://example.com/post"      # normalized, tracking stripped
+    assert item["starred"] is True                         # default
+    assert item["read_at"] is None                         # default: unread
+    assert item["category_name"] == "Read it later"        # default category
+
+    # duplicate URL -> 409 (even with tracking params differing)
+    r = client.post("/api/saved", json={"url": "https://example.com/post"})
+    assert r.status_code == 409
+
+    # explicit options: not starred, already read, custom category
+    async def no_fetch(url):
+        return None, url
+    monkeypatch.setattr(app_module, "_fetch_article", no_fetch)
+    r = client.post("/api/saved", json={"url": "https://other.org/a",
+                                        "category_name": "Research",
+                                        "starred": False, "unread": False})
+    assert r.status_code == 200
+    item = r.json()["item"]
+    assert r.json()["fetched"] is False
+    assert item["title"] == "https://other.org/a"          # stub fallback
+    assert item["category_name"] == "Research"
+    assert item["starred"] is False
+    assert item["read_at"] is not None
+
+    # saved items are searchable and listed under their category
+    cats = {c["name"]: c["id"] for c in client.get("/api/categories").json()["categories"]}
+    r = client.get("/api/items", params={"category_id": cats["Read it later"]})
+    assert [i["title"] for i in r.json()["items"]] == ["Saved Title"]
+
+    # the internal manual plugin is never offered as an addable plugin
+    names = [p["name"] for p in client.get("/api/sources").json()["plugins"]]
+    assert "manual" not in names
+
+    # and the manual source is never refreshed from the network
+    src = [s for s in client.get("/api/sources").json()["sources"] if s["plugin"] == "manual"]
+    assert len(src) == 2 and all(s["url"].startswith("saved://") for s in src)
+
+
+@pytest.mark.asyncio
+async def test_save_article_rejects_bad_url(client):
+    r = client.post("/api/saved", json={"url": "ftp://example.com/file"})
+    assert r.status_code == 422

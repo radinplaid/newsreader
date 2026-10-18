@@ -107,6 +107,7 @@ const ICONS = {
   rowsCompact: '<rect x="3" y="3.5" width="18" height="4.5" rx="1"/><rect x="3" y="9.75" width="18" height="4.5" rx="1"/><rect x="3" y="16" width="18" height="4.5" rx="1"/>',
   rss: '<path d="M4 11a9 9 0 0 1 9 9"/><path d="M4 4a16 16 0 0 1 16 16"/><circle cx="5" cy="19" r="1.5"/>',
   dot: '<circle cx="12" cy="12" r="5"/>',
+  bookmark: '<path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/>',
   dotFill: '<circle cx="12" cy="12" r="5" fill="currentColor"/>',
 };
 
@@ -2015,6 +2016,50 @@ $("#addForm").addEventListener("submit", async (ev) => {
       headers: { "Content-Type": "application/json" } });
     pollRefresh();
   } catch (err) { toast(err.message, true); }
+});
+
+/* ---------------- save article dialog ---------------- */
+$("#saveBtn").addEventListener("click", async () => {
+  const dlg = $("#saveDialog");
+  try {
+    const { categories } = await api("/categories");
+    const list = $("#saveCatList");
+    list.replaceChildren(...categories.map((c) => {
+      const opt = document.createElement("option");
+      opt.value = c.name;
+      return opt;
+    }));
+  } catch (_e) { /* suggestions are optional */ }
+  dlg.showModal();
+  dlg.querySelector('input[name="url"]').focus();
+});
+$("#saveCancel").addEventListener("click", () => $("#saveDialog").close());
+$("#saveForm").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const form = ev.target;
+  const data = new FormData(form);
+  const submit = $("#saveSubmit");
+  submit.disabled = true;
+  try {
+    const res = await api("/saved", { method: "POST",
+      body: JSON.stringify({
+        url: String(data.get("url") || "").trim(),
+        category_name: String(data.get("category") || "").trim() || null,
+        starred: data.has("starred"),
+        unread: data.has("unread"),
+      }),
+      headers: { "Content-Type": "application/json" } });
+    $("#saveDialog").close();
+    form.reset();
+    const cat = res.item.category_name;
+    toast(res.fetched ? `Saved to ${cat}`
+      : `Saved to ${cat}, but the page could not be downloaded (title is the URL)`);
+    refreshSidebar();
+    const visible = isAllView() || state.unread || state.starred ||
+      state.categoryId === res.item.category_id;
+    if (visible) loadItems(true);
+  } catch (err) { toast(err.message, true); }
+  finally { submit.disabled = false; }
 });
 
 /* ---------------- source transfer dialog ---------------- */

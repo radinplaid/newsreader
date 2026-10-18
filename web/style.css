@@ -340,9 +340,8 @@ button.chip:hover { color: var(--text); border-color: var(--text-3); }
   pointer-events: none;
 }
 .topbar-actions { display: flex; align-items: center; gap: 16px; flex: none; }
-.source-actions { display: flex; align-items: center; gap: 8px; }
-.source-actions .btn { white-space: nowrap; min-height: 36px; }
-.sources-btn { color: var(--text-2); }
+.side-foot-row { display: flex; gap: 6px; margin-bottom: 8px; }
+.side-foot-row .icon-only { flex: 1; width: auto; height: 36px; padding: 0; justify-content: center; }
 .utility-actions {
   display: flex;
   align-items: center;
@@ -352,7 +351,6 @@ button.chip:hover { color: var(--text); border-color: var(--text-3); }
 }
 .utility-actions .icon-btn { color: var(--text-3); }
 .utility-actions .icon-btn:hover { color: var(--text); }
-.add-label-mobile { display: none; }
 .article-sort { margin-left: auto; font-size: 12px; padding: 5px 26px 5px 9px; }
 #filterChips:not(:empty) { flex-basis: 100%; }
 
@@ -1204,6 +1202,7 @@ iframe.yt-frame {
   font-weight: 500;
 }
 .modal label.check input { width: auto; margin: 0; accent-color: var(--accent); }
+.check-row { display: flex; gap: 24px; margin-bottom: 14px; }
 .modal .hint { font-size: 12px; font-weight: 400; color: var(--text-3); margin: -4px 0 14px; }
 .modal .opt { opacity: 0.6; font-weight: 400; }
 .reddit-panel {
@@ -1567,12 +1566,8 @@ iframe.yt-frame {
             padding-right: calc(10px + var(--safe-right)); }
   .topbar .brand { display: none; }
   .topbar-actions { margin-left: auto; gap: 8px; }
-  .source-actions { gap: 4px; }
-  .source-actions .btn { padding: 7px 8px; font-size: 12px; }
   .utility-actions { gap: 2px; padding-left: 6px; }
   .topbar .icon-btn { width: 34px; height: 40px; }
-  .add-label-desktop { display: none; }
-  .add-label-mobile { display: inline; }
   .searchwrap { order: 1; flex: 0 0 100%; max-width: none; min-width: 0; margin: 0; }
   #search { padding-right: 38px; }
   .search-clear { right: 8px; }

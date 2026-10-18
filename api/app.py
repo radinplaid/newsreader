@@ -8,9 +8,12 @@ import os
 import time
 from contextlib import asynccontextmanager
 
+import httpx
+
 import crawler
 from crawler.base import FetchError
-from crawler.pool import shutdown_parse_pool
+from crawler.plugins.web import extract_article
+from crawler.pool import run_parse, shutdown_parse_pool
 from fastapi import FastAPI, HTTPException, Query, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -18,9 +21,11 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from newsreader.config import settings
-from newsreader.fetcher import Fetcher, RefreshBusy
+from newsreader.fetcher import Fetcher, RefreshBusy, USER_AGENT
 from newsreader.opml import export_opml, parse_opml
-from models.database import Database
+from models.database import Database, normalize_url
+
+SAVE_DEFAULT_CATEGORY = "Read it later"
 
 log = logging.getLogger("newsreader.api")
 
@@ -118,6 +123,14 @@ class ImportSource(BaseModel):
 
 class ImportIn(BaseModel):
     sources: list[ImportSource]
+
+
+class SaveIn(BaseModel):
+    """Save an article by URL ("read it later")."""
+    url: str
+    category_name: str | None = None
+    starred: bool = True
+    unread: bool = True
 
 
 def get_db(request: Request) -> Database:
@@ -282,11 +295,77 @@ async def list_tags(db: Database = Depends(get_db)):
     return {"tags": await db.list_tags()}
 
 
+# ----------------------------------------------------------------- saved articles
+async def _fetch_article(url: str) -> tuple[dict | None, str]:
+    """Download and extract one article. Returns (fields or None, final URL).
+
+    A failed download is not an error for the caller: the article is still
+    saved (titled by its URL) so the user never loses a link to read later.
+    """
+    try:
+        async with httpx.AsyncClient(
+            timeout=settings.nr_request_timeout, follow_redirects=True,
+            headers={"User-Agent": USER_AGENT, "Accept-Language": "en",
+                     "Accept-Encoding": "gzip, deflate",
+                     "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.5"},
+        ) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            text, final = resp.text, str(resp.url)
+    except Exception as exc:  # noqa: BLE001 - any failure degrades to a stub
+        log.info("could not download %s for saving: %s", url, exc)
+        return None, url
+    article = await run_parse(extract_article, text, final)
+    return article, final
+
+
+@app.post("/api/saved")
+async def save_article(body: SaveIn, db: Database = Depends(get_db)):
+    """Add an article by URL to a category (default "Read it later").
+
+    Starred and unread are the defaults. The article is stored like any
+    other item (search, tags and read state all work), under the manual
+    source of its category. 409 when the URL is already in the library.
+    """
+    url = _normalize_url(body.url)
+    duplicate = "this article is already in your library"
+    if await db.find_item_by_url(url) is not None:
+        raise HTTPException(409, duplicate)
+    category = (body.category_name or "").strip() or SAVE_DEFAULT_CATEGORY
+    article, final = await _fetch_article(url)
+    guid = normalize_url(final)
+    if guid != normalize_url(url) and await db.find_item_by_url(guid) is not None:
+        raise HTTPException(409, duplicate)
+    article = article or {}
+    row = {
+        "guid": guid, "url": guid,
+        "title": article.get("title") or guid,
+        "summary": article.get("summary") or "",
+        "content": article.get("content") or "",
+        "author": article.get("author") or "",
+        "published_at": article.get("published_at"),
+        "image_url": article.get("image_url") or "",
+        "tags": [], "extra": {},
+    }
+    source_id = await db.saved_source_id(category)
+    _, _, new_ids = await db.upsert_items(source_id, [row])
+    if not new_ids:  # URL taken by a concurrent refresh of a feed
+        raise HTTPException(409, duplicate)
+    item_id = new_ids[0]
+    if body.starred:
+        await db.set_starred(item_id, True)
+    if not body.unread:
+        await db.set_item_read(item_id, True)
+    return {"item": await db.get_item(item_id), "fetched": bool(article)}
+
+
 # ----------------------------------------------------------------- sources
 @app.get("/api/sources")
 async def list_sources(db: Database = Depends(get_db)):
     return {"sources": await db.list_sources(),
-            "plugins": [{"name": p.name, "label": p.label} for p in crawler.all_plugins()]}
+            # plugins without URL patterns (e.g. "manual") are internal, not addable
+            "plugins": [{"name": p.name, "label": p.label} for p in crawler.all_plugins()
+                        if p.patterns]}
 
 
 # ----------------------------------------------------------------- export/import

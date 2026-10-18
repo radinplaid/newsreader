@@ -675,6 +675,39 @@ class Database:
                                (1 if dismissed else 0, item_id)) as cur:
                 return cur.rowcount > 0
 
+    async def find_item_by_url(self, url: str) -> int | None:
+        """id of the item stored for this URL (any source), or None."""
+        conn = await self.get_conn()
+        async with conn.execute(
+            "SELECT id FROM items WHERE url = ? LIMIT 1", (normalize_url(url),)
+        ) as cur:
+            row = await cur.fetchone()
+            return row["id"] if row else None
+
+    async def saved_source_id(self, category_name: str) -> int:
+        """The manual source holding saved articles for a category (created on demand).
+
+        Saved articles inherit their category through their source, so each
+        category gets its own "manual" source. It is re-attached to the
+        category on every call, which heals one deleted (and so unassigned).
+        """
+        category = await self.create_category(category_name)
+        # keyed by name: a deleted and recreated category finds its source again
+        url = f"saved://category/{category['name'].lower()}"
+        async with self.write() as conn:
+            async with conn.execute(
+                "INSERT INTO sources (url, name, plugin, category_id, created_at) "
+                "VALUES (?, 'Saved', 'manual', ?, ?) ON CONFLICT(url) DO NOTHING RETURNING id",
+                (url, category["id"], time.time()),
+            ) as cur:
+                row = await cur.fetchone()
+            if row is None:
+                async with conn.execute("SELECT id FROM sources WHERE url = ?", (url,)) as cur:
+                    row = await cur.fetchone()
+                await conn.execute("UPDATE sources SET category_id = ? WHERE id = ?",
+                                   (category["id"], row["id"]))
+            return row["id"]
+
     # -- read state ----------------------------------------------------------
     async def set_item_read(self, item_id: int, read: bool) -> bool:
         """Mark one item read (stamps read_at) or unread (clears it)."""

@@ -26,11 +26,6 @@
     <kbd id="searchShortcut">/</kbd>
   </div>
   <div class="topbar-actions">
-    <div class="source-actions" role="group" aria-label="Source actions">
-      <button id="ioBtn" class="btn ghost sources-btn" aria-haspopup="dialog"
-              aria-controls="sourcesDialog" title="Manage sources">Sources</button>
-      <button id="addBtn" class="btn primary add-btn" title="Add a news source"><span data-icon="plus"></span><span class="add-label-desktop">Add source</span><span class="add-label-mobile">Source</span></button>
-    </div>
     <div class="utility-actions" role="group" aria-label="App utilities">
       <button id="themeBtn" class="icon-btn" aria-label="Toggle theme" title="Toggle theme"></button>
       <button id="helpBtn" class="icon-btn" data-icon="help" aria-label="Keyboard shortcuts" title="Keyboard shortcuts (?)"></button>
@@ -65,6 +60,14 @@
       <div class="side-stats">
         <span id="dbStats"></span>
         <span id="refreshStatus" class="refresh-status hidden"></span>
+      </div>
+      <div class="side-foot-row" role="group" aria-label="Article and source actions">
+        <button id="saveBtn" class="btn ghost icon-only" data-icon="bookmark"
+                aria-label="Save article from URL" title="Save article from URL (read it later)"></button>
+        <button id="addBtn" class="btn ghost icon-only" data-icon="plus"
+                aria-label="Add source" title="Add a news source"></button>
+        <button id="ioBtn" class="btn ghost icon-only" data-icon="transfer" aria-haspopup="dialog"
+                aria-controls="sourcesDialog" title="Import / export sources" aria-label="Import or export sources"></button>
       </div>
       <button id="refreshBtn" class="btn primary block">
         <span id="refreshIcon" class="icon-slot" data-icon="refresh"></span> Refresh all
@@ -199,6 +202,29 @@
     <div class="modal-actions">
       <button type="button" class="btn ghost" id="addCancel">Cancel</button>
       <button type="submit" class="btn primary">Add source</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- save article dialog -->
+<dialog id="saveDialog" class="modal">
+  <form id="saveForm" method="dialog">
+    <h3>Save article</h3>
+    <label>URL
+      <input name="url" type="text" required placeholder="https://example.com/article" autocomplete="off" spellcheck="false">
+    </label>
+    <p class="hint">The page is downloaded and stored, so it stays readable and searchable here.</p>
+    <label>Category
+      <input name="category" type="text" required value="Read it later" list="saveCatList" autocomplete="off">
+      <datalist id="saveCatList"></datalist>
+    </label>
+    <div class="check-row">
+      <label class="check"><input name="starred" type="checkbox" checked> Starred</label>
+      <label class="check"><input name="unread" type="checkbox" checked> Unread</label>
+    </div>
+    <div class="modal-actions">
+      <button type="button" class="btn ghost" id="saveCancel">Cancel</button>
+      <button type="submit" class="btn primary" id="saveSubmit">Save</button>
     </div>
   </form>
 </dialog>

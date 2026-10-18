@@ -599,3 +599,24 @@ async def test_list_items_carries_extra_for_cards(db):
     full, _ = await db.list_items(source_id=sid, include_content=True)
     assert full[0]["extra"]["score"] == 250
     assert "content" in full[0]
+
+
+@pytest.mark.asyncio
+async def test_saved_source_per_category_is_reused_and_reattached(tmp_path):
+    db = Database(str(tmp_path / "saved.db"))
+    await db.init()
+    try:
+        first = await db.saved_source_id("Read it later")
+        assert await db.saved_source_id("Read it later") == first
+        other = await db.saved_source_id("Research")
+        assert other != first
+
+        # deleting the category unassigns its saved source; the next save heals it
+        cat = (await db.create_category("Read it later"))["id"]
+        await db.delete_category(cat)
+        assert (await db.get_source(first))["category_id"] is None
+        assert await db.saved_source_id("Read it later") == first
+        src = await db.get_source(first)
+        assert src["category_name"] == "Read it later" and src["plugin"] == "manual"
+    finally:
+        await db.close()
