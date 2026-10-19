@@ -42,6 +42,46 @@ def _in_error_backoff(src: dict, now: float) -> bool:
     return now - (src.get("last_refreshed_at") or 0) < _error_backoff_secs(streak)
 
 
+# plugins whose item URLs come from publishers that may redirect/syndicate;
+# YouTube and Reddit URLs are canonical, and a page GET per item is costly
+_REDIRECT_PLUGINS = frozenset({"rss", "web"})
+_RESOLVE_LIMIT = 50        # max redirect lookups per source refresh
+_RESOLVE_TIMEOUT = 10.0    # seconds per lookup; failures keep the original URL
+
+
+async def resolve_redirects(client: httpx.AsyncClient, rows: list[dict],
+                            known: dict[str, float | None]) -> None:
+    """Rewrite row["url"] of new items to the URL they finally redirect to.
+
+    Publishers often serve one story under several URLs that redirect to a
+    single page; comparing the raw feed URLs would store each as a separate
+    article. Only items whose guid is not stored yet are looked up, each
+    distinct URL once, at most _RESOLVE_LIMIT per call. A failed or blocked
+    lookup keeps the original URL, so this never drops an item.
+    """
+    targets = [r for r in rows if r["url"] and r["guid"] not in known]
+    if not targets:
+        return
+    cache: dict[str, str] = {}
+    sem = asyncio.Semaphore(4)
+
+    async def lookup(url: str) -> str:
+        async with sem:
+            try:
+                async with client.stream("GET", url, timeout=_RESOLVE_TIMEOUT) as resp:
+                    return str(resp.url)  # body is never read
+            except Exception as exc:  # noqa: BLE001 - keep the original on any failure
+                log.debug("redirect lookup failed for %s: %s", url, exc)
+                return url
+
+    unique = list(dict.fromkeys(r["url"] for r in targets))[:_RESOLVE_LIMIT]
+    results = await asyncio.gather(*(lookup(u) for u in unique))
+    cache.update(zip(unique, results))
+    for r in targets:
+        if r["url"] in cache:
+            r["url"] = cache[r["url"]]
+
+
 def _error_text(exc: BaseException) -> str:
     """Readable error line; walks the cause chain when str(exc) is empty.
 
@@ -237,6 +277,8 @@ class Fetcher:
                 )
                 fetched = await plugin.fetch(ctx)
                 rows = [item.to_row() for item in fetched.items]
+                if plugin.name in _REDIRECT_PLUGINS:
+                    await resolve_redirects(client, rows, known)
                 inserted, updated, new_ids = await self.db.upsert_items(src["id"], rows)
                 result["inserted"], result["updated"] = inserted, updated
                 # capped list of fresh row ids: lets the web client surface
