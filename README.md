@@ -24,11 +24,14 @@ serverless HTML5 web client (plain static files — no build step, no framework)
 * **Reliable dates** — dates are parsed from feeds, listing cards (`<time>`,
   meta tags, text patterns) and article pages. Items still missing a date are
   backfilled by scraping the article page / video info, bounded per refresh
-  and prioritized until the backlog is resolved. Dates in the future are
-  treated as missing (feeds whose CMS mislabels local time as UTC), so they
-  never make an article look "just now" when it isn't. Anything that still has
-  no date falls back to the date the item was first seen, and undated items
-  sort after dated ones in both sort orders.
+  and prioritized until the backlog is resolved. The backlog is worked
+  through in turn, so an item that has scrolled off a listing is still
+  finished off — and one article page that cannot be fetched never holds up
+  the others (it is tried three times and then left alone). Dates in the
+  future are treated as missing (feeds whose CMS mislabels local time as
+  UTC), so they never make an article look "just now" when it isn't.
+  Anything that still has no date falls back to the date the item was first
+  seen, and undated items sort after dated ones in both sort orders.
 * **Many items, fast** — SQLite (WAL) with indexes handles 10,000s of items
   comfortably; the listing endpoint is paginated and index-driven.
 * **Full text search** — FTS5 index over title, summary and article content,
@@ -318,6 +321,13 @@ once a page reaches items already in the DB (`"stop_on_known": false` opts
 out); YouTube stops its per-video date fetches after
 `"date_fetch_max_errors"` failures per refresh and remembers bot-check /
 members-only failures in `date_fetch_skip` for 3 days.
+
+Two cursors are kept on the source row and are not meant to be edited: they
+say where in the backlog the next refresh starts. `date_fetch_cursor` is
+YouTube's, `backfill_cursor` belongs to the web scraper. Both exist so that
+a refresh which gives up early — YouTube is bot checking, a page does not
+exist — still moves on to the next items instead of trying the same ones
+for ever.
 
 ## Performance notes
 

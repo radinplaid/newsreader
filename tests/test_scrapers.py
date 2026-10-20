@@ -370,6 +370,92 @@ async def test_web_plugin_reports_no_feed_url_when_none_discovered():
 
 
 @pytest.mark.asyncio
+async def test_web_plugin_enriches_stored_items_that_left_the_listing():
+    """An item that has scrolled off the listing must still be finished off.
+
+    The listing only shows the newest posts, so an item that falls off it
+    would never be fetched again - and would stay without a date for ever.
+    The plugin therefore also works through what the database still holds
+    unfinished.
+    """
+    requested = []
+
+    def handler(request):
+        requested.append(str(request.url))
+        if request.url.path == "/blog":
+            return httpx.Response(200, text=THIN_WITH_FEED)
+        return httpx.Response(200, text=ARTICLE_HTML)
+
+    backlog = [{
+        "guid": "https://ex.com/blog/old-post",
+        "url": "https://ex.com/blog/old-post",
+        "title": "Old Post", "summary": "", "content": "", "author": "",
+        "published_at": None, "image_url": "", "tags": [], "extra": {},
+    }]
+    ctx = _mock_ctx(handler, url="https://ex.com/blog",
+                    known_dates={"https://ex.com/blog/old-post": None},
+                    config={"fetch_content": True, "content_fetch_limit": 4})
+    ctx.backlog = backlog
+    result = await WebPlugin().fetch(ctx)
+    await ctx.client.aclose()
+
+    assert "https://ex.com/blog/old-post" in requested
+    by_guid = {i.guid: i for i in result.items}
+    assert by_guid["https://ex.com/blog/old-post"].published_at is not None
+    assert by_guid["https://ex.com/blog/old-post"].content
+
+
+@pytest.mark.asyncio
+async def test_web_plugin_backfill_cursor_rotates_the_stored_items():
+    """Every stored item gets its turn, even the ones that cannot be
+    fetched: the cursor moves on instead of retrying the same head."""
+    requested = []
+
+    def handler(request):
+        requested.append(str(request.url))
+        if request.url.path == "/blog":
+            return httpx.Response(200, text=THIN_WITH_FEED)
+        if "gone" in request.url.path:
+            return httpx.Response(404, text="not found")
+        return httpx.Response(200, text=ARTICLE_HTML)
+
+    backlog = [{
+        "guid": f"https://ex.com/blog/p{i}",
+        "url": f"https://ex.com/blog/p{i}",
+        "title": f"Post {i}", "summary": "", "content": "", "author": "",
+        "published_at": None, "image_url": "", "tags": [], "extra": {},
+    } for i in range(4)]
+    backlog[0]["url"] = "https://ex.com/blog/gone"
+    backlog[0]["guid"] = "https://ex.com/blog/gone"
+
+    def make_ctx(cursor):
+        ctx = _mock_ctx(handler, url="https://ex.com/blog",
+                        known_dates={b["guid"]: None for b in backlog},
+                        config={"fetch_content": True, "content_fetch_limit": 2,
+                                "backfill_cursor": cursor})
+        ctx.backlog = list(backlog)
+        return ctx
+
+    ctx = make_ctx(0)
+    result = await WebPlugin().fetch(ctx)
+    await ctx.client.aclose()
+    # the listing holds one new item, so one slot of the budget is left
+    # for the stored ones
+    assert result.config_updates["backfill_cursor"] == 1
+    assert "https://ex.com/blog/gone" in requested    # tried, and it failed
+
+    # the next round starts further along, so the item that failed does not
+    # hold up the others
+    requested.clear()
+    ctx2 = make_ctx(result.config_updates["backfill_cursor"])
+    result2 = await WebPlugin().fetch(ctx2)
+    await ctx2.client.aclose()
+    assert "https://ex.com/blog/gone" not in requested
+    assert "https://ex.com/blog/p1" in requested
+    assert result2.config_updates["backfill_cursor"] == 2
+
+
+@pytest.mark.asyncio
 async def test_get_text_retries_transient_errors(monkeypatch):
     monkeypatch.setattr("crawler.base.RETRY_BACKOFF", (0.0, 0.0))
     calls = []
@@ -597,11 +683,100 @@ async def test_youtube_date_fetch_skips_remembered_failures(monkeypatch):
                     config={"date_fetch_skip": {"v1": time.time()}})
     result = await yt_mod.YouTubePlugin().fetch(ctx)
     await ctx.client.aclose()
-    assert [u.rsplit("=", 1)[1] for u in fetched] == ["v2", "v3"]
+    assert sorted(u.rsplit("=", 1)[1] for u in fetched) == ["v2", "v3"]
     assert result.config_updates == {}
     by_guid = {i.guid: i for i in result.items}
     assert by_guid["v2"].published_at is not None
     assert by_guid["v1"].published_at is None
+
+
+@pytest.mark.asyncio
+async def test_youtube_date_fetch_rotates_the_backlog(monkeypatch):
+    """Every video must get its turn.
+
+    A run that always started at the head of the playlist left the videos
+    behind it without a date for ever: they were never reached, so the
+    cursor moves on and the next refresh starts where the last one stopped.
+    """
+    fetched = []
+
+    def fake_extract(url, opts):
+        if opts.get("extract_flat"):
+            return _yt_playlist([f"v{i}" for i in range(10)])
+        fetched.append(url.rsplit("=", 1)[1])
+        return {"timestamp": 1758400000, "description": "d", "uploader": "Chan"}
+
+    monkeypatch.setattr(yt_mod, "_extract", fake_extract)
+    known = {f"v{i}": None for i in range(10)}   # stored, but no date yet
+    ctx = _mock_ctx(lambda r: httpx.Response(200),
+                    url="https://www.youtube.com/@chan/videos",
+                    known_dates=known,
+                    config={"date_fetch_limit": 4})
+    result = await yt_mod.YouTubePlugin().fetch(ctx)
+    await ctx.client.aclose()
+    assert sorted(fetched) == ["v0", "v1", "v2", "v3"]
+    assert result.config_updates["date_fetch_cursor"] == 4
+
+    # the next refresh starts where the last one stopped
+    fetched.clear()
+    ctx2 = _mock_ctx(lambda r: httpx.Response(200),
+                     url="https://www.youtube.com/@chan/videos",
+                     known_dates=known,
+                     config={"date_fetch_limit": 4, "date_fetch_cursor": 4})
+    result2 = await yt_mod.YouTubePlugin().fetch(ctx2)
+    await ctx2.client.aclose()
+    assert sorted(fetched) == ["v4", "v5", "v6", "v7"]
+    assert result2.config_updates["date_fetch_cursor"] == 8
+
+
+@pytest.mark.asyncio
+async def test_youtube_date_fetch_bail_out_still_moves_the_cursor(monkeypatch):
+    """Giving up after a few errors must not leave the rest of the backlog
+    where it was, or the same videos would be retried for ever."""
+    attempts = []
+
+    def fake_extract(url, opts):
+        if opts.get("extract_flat"):
+            return _yt_playlist([f"v{i}" for i in range(10)])
+        attempts.append(url.rsplit("=", 1)[1])
+        raise Exception("HTTP Error 500: Internal Server Error")
+
+    monkeypatch.setattr(yt_mod, "_extract", fake_extract)
+    known = {f"v{i}": None for i in range(10)}
+    ctx = _mock_ctx(lambda r: httpx.Response(200),
+                    url="https://www.youtube.com/@chan/videos",
+                    known_dates=known,
+                    config={"date_fetch_limit": 4, "date_fetch_max_errors": 1})
+    result = await yt_mod.YouTubePlugin().fetch(ctx)
+    await ctx.client.aclose()
+    assert attempts                          # it tried
+    assert len(attempts) < 10                # and gave up early
+    assert result.config_updates["date_fetch_cursor"] == 4
+
+
+@pytest.mark.asyncio
+async def test_youtube_date_fetch_keeps_half_the_budget_for_the_backlog(monkeypatch):
+    """New videos come first, but they never take the whole budget: the
+    backlog is what the cursor works through."""
+    fetched = []
+
+    def fake_extract(url, opts):
+        if opts.get("extract_flat"):
+            return _yt_playlist([f"v{i}" for i in range(10)])
+        fetched.append(url.rsplit("=", 1)[1])
+        return {"timestamp": 1758400000}
+
+    monkeypatch.setattr(yt_mod, "_extract", fake_extract)
+    known = {f"v{i}": None for i in range(5)}   # five stored, five new
+    ctx = _mock_ctx(lambda r: httpx.Response(200),
+                    url="https://www.youtube.com/@chan/videos",
+                    known_dates=known,
+                    config={"date_fetch_limit": 4})
+    result = await yt_mod.YouTubePlugin().fetch(ctx)
+    await ctx.client.aclose()
+    # the new ones are v5..v9, the backlog v0..v4
+    assert sorted(fetched) == ["v0", "v1", "v5", "v6"]
+    assert result.config_updates["date_fetch_cursor"] == 2
 
 
 def _reddit_child(pid, **kw):

@@ -19,6 +19,7 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import aiosqlite
 
+from crawler.base import ENRICH_ATTEMPTS_KEY, MAX_ENRICH_ATTEMPTS
 from newsreader.config import settings
 
 _SCHEMA = """
@@ -505,7 +506,9 @@ class Database:
         first, so a per-refresh budget always reaches the stragglers instead
         of the newest ones only — a listing page that has scrolled past an
         item must never be the reason it stays undated forever. Dismissed
-        items are skipped: nobody is going to read them again.
+        items are skipped: nobody is going to read them again, and items
+        whose page could not be fetched are skipped once they have been
+        tried often enough (see MAX_ENRICH_ATTEMPTS).
 
         Every stored column is returned so the caller can merge what it
         fetches back into the existing row without erasing anything.
@@ -516,8 +519,11 @@ class Database:
             "published_at, extra FROM items "
             "WHERE source_id=? AND dismissed=0 "
             "AND (published_at IS NULL OR content='') "
+            "AND COALESCE(json_extract(CASE WHEN json_valid(extra) THEN extra "
+            "                                   ELSE '{}' END, '$.' || ?), 0) < ? "
             "ORDER BY first_seen_at ASC, id ASC LIMIT ?",
-            (source_id, max(1, int(limit))),
+            (source_id, ENRICH_ATTEMPTS_KEY, MAX_ENRICH_ATTEMPTS,
+             max(1, int(limit))),
         ) as cur:
             rows = await cur.fetchall()
         out = []
@@ -605,7 +611,10 @@ class Database:
                         published_at=COALESCE(excluded.published_at, items.published_at),
                         image_url=CASE WHEN excluded.image_url != '' THEN excluded.image_url
                                        ELSE items.image_url END,
-                        extra=excluded.extra, fetched_at=excluded.fetched_at
+                        extra=json_patch(CASE WHEN json_valid(items.extra)
+                                             THEN items.extra ELSE '{}' END,
+                                         excluded.extra),
+                        fetched_at=excluded.fetched_at
                     """,
                     rows,
                 )

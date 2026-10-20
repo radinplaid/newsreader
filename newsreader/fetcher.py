@@ -47,6 +47,8 @@ def _in_error_backoff(src: dict, now: float) -> bool:
 _REDIRECT_PLUGINS = frozenset({"rss", "web"})
 _RESOLVE_LIMIT = 50        # max redirect lookups per source refresh
 _RESOLVE_TIMEOUT = 10.0    # seconds per lookup; failures keep the original URL
+#: how many stored items are offered to a plugin as enrichment work
+_BACKLOG_SIZE = 200
 
 
 async def resolve_redirects(client: httpx.AsyncClient, rows: list[dict],
@@ -276,9 +278,15 @@ class Fetcher:
                 result["plugin"] = plugin.name
                 config = {**plugin.default_config(), **(src.get("config") or {})}
                 known = await self.db.known_dates(src["id"])
+                # stored items that still miss a date or a body: the plugin
+                # works through them too, so an item that has scrolled off
+                # the listing is not left half-finished for ever
+                backlog = await self.db.backfill_items(
+                    src["id"], limit=_BACKLOG_SIZE)
                 ctx = FetchContext(
                     source=src, client=client, known_dates=known, config=config,
                     logger=logging.LoggerAdapter(log, {"source": name}),
+                    backlog=backlog,
                 )
                 fetched = await plugin.fetch(ctx)
                 rows = [item.to_row() for item in fetched.items]

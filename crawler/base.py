@@ -20,6 +20,14 @@ TRANSIENT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadError,
 #: seconds between retry attempts (two retries per request)
 RETRY_BACKOFF = (1.0, 2.5)
 
+#: how many times an article page may be fetched for one item before it is
+#: given up on. Some pages simply do not exist, and trying them again on
+#: every refresh would spend the whole budget on items that can never be
+#: filled in. The count is kept in the item's extra field.
+MAX_ENRICH_ATTEMPTS = 3
+#: the key the attempt counter is stored under
+ENRICH_ATTEMPTS_KEY = "enrich_attempts"
+
 
 @dataclass
 class ParsedItem:
@@ -62,6 +70,11 @@ class FetchContext:
     known_dates: dict[str, float | None]   # guid -> stored published_at
     config: dict                      # plugin defaults merged with source config
     logger: logging.Logger | logging.LoggerAdapter = field(default_factory=logging.getLogger)
+    #: stored items of this source that still need enrichment (no date or no
+    #: body), oldest first. A plugin that fetches article pages works through
+    #: this instead of only the items on the current listing: an item that has
+    #: scrolled off the listing would otherwise never be filled in.
+    backlog: list[dict] = field(default_factory=list)
     etag: str = ""                    # captured from responses, persisted by the fetcher
     last_modified: str = ""
     requests: int = 0

@@ -33,6 +33,8 @@ _STICKY_ERROR_MARKERS = (
 )
 _STICKY_SKIP_SECS = 3 * 86400
 _SKIP_MAP_MAX = 1000
+#: how many videos are extracted at the same time
+_DATE_CONCURRENCY = 6
 
 
 def _extract(url: str, opts: dict) -> dict:
@@ -60,6 +62,17 @@ def _upload_epoch(info: dict) -> float | None:
         except ValueError:
             return None
     return None
+
+
+def _config_updates(skip: dict, raw_skip: dict, cursor: int, raw_cursor,
+                    size: int) -> dict | None:
+    """The source config changes worth persisting, or None if there are none."""
+    updates: dict = {}
+    if skip != raw_skip:
+        updates["date_fetch_skip"] = skip
+    if size and cursor != raw_cursor:
+        updates["date_fetch_cursor"] = cursor
+    return updates or None
 
 
 @register
@@ -117,21 +130,25 @@ class YouTubePlugin(Plugin):
 
         config_updates = {}
         if ctx.config.get("fetch_video_dates", True):
-            skip = await self._fetch_dates(ctx, items)
-            if skip is not None:
-                config_updates["date_fetch_skip"] = skip
+            updates = await self._fetch_dates(ctx, items)
+            if updates:
+                config_updates.update(updates)
         return FetchResult(items=items, source_name=source_name,
                            config_updates=config_updates)
 
     async def _fetch_dates(self, ctx: FetchContext, items: list[ParsedItem]) -> dict | None:
         """Fetch upload dates/descriptions for new and still-undated videos.
 
-        Returns the updated date_fetch_skip map (guid -> failed-at time) when
-        it changed, so the fetcher can persist it on the source row: videos
-        that failed with a sticky error are not retried until their entry
-        expires, and once date_fetch_max_errors extractions fail in one run
-        the rest are skipped (YouTube is bot checking or rate limiting, so
-        hammering on cannot succeed).
+        Returns the config updates to persist on the source row: the videos
+        that failed with a sticky error (not retried until their entry
+        expires) and the cursor that says where in the backlog to pick up
+        next time.
+
+        The cursor is what keeps the backlog moving. A run gives up after a
+        few errors (YouTube is bot checking), and without a cursor every run
+        started at the same videos again - the ones behind them never got a
+        date at all. Rotating the backlog means each video gets its turn
+        across refreshes, even while YouTube is refusing to answer.
         """
         limit = int(ctx.config.get("date_fetch_limit", 100))
         max_errors = max(1, int(ctx.config.get("date_fetch_max_errors", 5)))
@@ -139,50 +156,69 @@ class YouTubePlugin(Plugin):
         raw_skip = ctx.config.get("date_fetch_skip") or {}
         skip = {g: ts for g, ts in raw_skip.items()
                 if isinstance(ts, (int, float)) and ts > now - _STICKY_SKIP_SECS}
-        # new videos first, then known-but-still-undated ones (backfill);
-        # videos the DB already dates are never re-extracted, so the
-        # per-refresh budget keeps reaching the undated tail
-        need = [it for it in items
-                if (it.guid not in ctx.known_dates
-                    or (ctx.known_dates[it.guid] is None and it.published_at is None))
-                and it.guid not in skip][:limit]
+        raw_cursor = ctx.config.get("date_fetch_cursor")
+        cursor = int(raw_cursor) if isinstance(raw_cursor, (int, float)) else 0
+
+        # new videos first: there are only a handful of them per refresh and
+        # they are the ones the reader is waiting for
+        fresh = [it for it in items
+                 if it.guid not in ctx.known_dates and it.guid not in skip]
+        # then the backlog: videos that are stored but still have no date
+        backlog = [it for it in items
+                   if it.guid in ctx.known_dates and ctx.known_dates[it.guid] is None
+                   and it.published_at is None and it.guid not in skip]
+        # rotate the backlog, so a run that bails out early still moves on
+        size = len(backlog)
+        if size:
+            cursor %= size
+            backlog = backlog[cursor:] + backlog[:cursor]
+
+        # the backlog always keeps at least half of the budget: it is what
+        # the rotation is about, and there are only a few new videos anyway
+        need_fresh = fresh[:max(1, limit // 2)]
+        need_backlog = backlog[:max(0, limit - len(need_fresh))]
+        need = need_fresh + need_backlog
         if not need:
-            return skip if skip != raw_skip else None
-        sem = asyncio.Semaphore(6)
+            return _config_updates(skip, raw_skip, cursor, raw_cursor, size)
+
         logger = ctx.logger
         errors = 0
-        bail = False
 
         async def one(item: ParsedItem) -> None:
-            nonlocal errors, bail
-            async with sem:
-                if bail:
-                    return
-                try:
-                    info = await asyncio.to_thread(_extract, item.url, _FULL_OPTS)
-                except Exception as exc:  # noqa: BLE001 - date fetch is best effort
-                    errors += 1
-                    logger.debug("yt date fetch failed for %s: %s", item.url, exc)
-                    if _sticky_failure(exc):
-                        skip[item.guid] = time.time()
-                    if not bail and errors >= max_errors:
-                        bail = True
-                        logger.warning(
-                            "yt date fetch giving up after %d errors (bot check or "
-                            "rate limit?); remaining videos wait for a later refresh",
-                            errors)
-                    return
-                item.published_at = _upload_epoch(info) or item.published_at
-                if info.get("description"):
-                    item.summary = info["description"][:500]
-                    item.content = info["description"][:4000]
-                if info.get("uploader"):
-                    item.author = info["uploader"]
-                if info.get("thumbnail"):
-                    item.image_url = info["thumbnail"]
+            nonlocal errors
+            try:
+                info = await asyncio.to_thread(_extract, item.url, _FULL_OPTS)
+            except Exception as exc:  # noqa: BLE001 - date fetch is best effort
+                errors += 1
+                logger.debug("yt date fetch failed for %s: %s", item.url, exc)
+                if _sticky_failure(exc):
+                    skip[item.guid] = time.time()
+                return
+            item.published_at = _upload_epoch(info) or item.published_at
+            if info.get("description"):
+                item.summary = info["description"][:500]
+                item.content = info["description"][:4000]
+            if info.get("uploader"):
+                item.author = info["uploader"]
+            if info.get("thumbnail"):
+                item.image_url = info["thumbnail"]
 
-        await asyncio.gather(*(one(it) for it in need), return_exceptions=True)
+        # in batches, so giving up after too many errors is decided between
+        # batches instead of in the middle of one
+        for start in range(0, len(need), _DATE_CONCURRENCY):
+            if errors >= max_errors:
+                logger.warning(
+                    "yt date fetch giving up after %d errors (bot check or "
+                    "rate limit?); the rest of the backlog waits for a later "
+                    "refresh", errors)
+                break
+            batch = need[start:start + _DATE_CONCURRENCY]
+            await asyncio.gather(*(one(it) for it in batch), return_exceptions=True)
+
         if len(skip) > _SKIP_MAP_MAX:
             keep = sorted(skip, key=skip.get, reverse=True)[:_SKIP_MAP_MAX]
             skip = {g: skip[g] for g in keep}
-        return skip if skip != raw_skip else None
+        # the cursor moves past the videos that were taken into the budget,
+        # so a run that gave up early still makes progress on the backlog
+        next_cursor = (cursor + len(need_backlog)) % size if size else cursor
+        return _config_updates(skip, raw_skip, next_cursor, raw_cursor, size)

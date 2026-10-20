@@ -21,7 +21,8 @@ from collections import defaultdict
 from urllib.parse import parse_qs, unquote, urlparse
 
 from crawler import register
-from crawler.base import Plugin, FetchContext, FetchResult, ParsedItem
+from crawler.base import (ENRICH_ATTEMPTS_KEY, MAX_ENRICH_ATTEMPTS, Plugin,
+                          FetchContext, FetchResult, ParsedItem)
 from crawler.pool import run_parse
 from crawler.textutil import (absolutize, clean, first_image_src, find_date_in_text,
                               host_of, parse_date, soup_from, text_of)
@@ -53,6 +54,35 @@ def _clean_title(text: str) -> str:
             break
         text = stripped
     return text
+
+
+def _read_cursor(value) -> int:
+    """The position in the backlog to start from (0 when there is none)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    return int(value)
+
+
+def _attempts(item: dict) -> int:
+    """How many times fetching this item's page has failed."""
+    extra = item.get("extra") or {}
+    value = extra.get(ENRICH_ATTEMPTS_KEY)
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+def _count_failure(item: dict) -> None:
+    """Remember that the page could not be fetched, so it is not retried
+    for ever."""
+    extra = dict(item.get("extra") or {})
+    extra[ENRICH_ATTEMPTS_KEY] = _attempts(item) + 1
+    item["extra"] = extra
+
+
+def _clear_failure(item: dict) -> None:
+    """The item was filled in after all: it gets another chance later."""
+    extra = dict(item.get("extra") or {})
+    if extra.pop(ENRICH_ATTEMPTS_KEY, None) is not None:
+        item["extra"] = extra
 
 
 def _is_chrome(node) -> bool:
@@ -522,10 +552,19 @@ class WebPlugin(Plugin):
         limit = int(ctx.config.get("max_items", 300))
         items = items[:limit]
 
+        backfilled: list[dict] = []
         if ctx.config.get("fetch_content", True):
-            await self._enrich_from_pages(ctx, items)
+            backfilled, cursor = await self._enrich_from_pages(ctx, items)
+            if cursor is not None:
+                config_updates["backfill_cursor"] = cursor
 
-        return FetchResult(items=[ParsedItem(**i) for i in items],
+        # the backfilled items are stored items that were finished off; they
+        # travel back through the upsert so the row is updated in place.
+        # An item can be in the listing *and* in the backlog, and only the
+        # first copy of an item is stored - so the enriched copy goes first.
+        enriched_guids = {b["guid"] for b in backfilled}
+        rows = [i for i in items if i["guid"] not in enriched_guids] + backfilled
+        return FetchResult(items=[ParsedItem(**i) for i in rows],
                            source_name=source_name, config_updates=config_updates)
 
     async def _items_from_feed(self, ctx, feed_url: str, page_url: str) -> tuple[list[dict], str | None]:
@@ -549,24 +588,49 @@ class WebPlugin(Plugin):
             return [], None, None
         return [i.to_row() for i in parsed], name, feed_url
 
-    async def _enrich_from_pages(self, ctx: FetchContext, items: list[dict]) -> None:
+    async def _enrich_from_pages(self, ctx: FetchContext,
+                                 items: list[dict]) -> tuple[list[dict], int | None]:
         """Fetch article pages for new items and for items still missing a
-        date in the DB (backfill): content/date/image land in the DB via
-        the upsert. Items the DB already dates are left alone, so the
-        per-refresh budget reaches the undated stragglers."""
+        date or a body in the DB (backfill).
+
+        New items from the listing come first. After them come the stored
+        items that are still unfinished, taken from the database rather than
+        from the listing: an item that has scrolled off the page would
+        otherwise never be filled in. Those are worked through in turn, so
+        one article that cannot be fetched does not hold up the rest.
+
+        Returns the stored items that were actually enriched and the cursor
+        for the next round.
+        """
         limit = int(ctx.config.get("content_fetch_limit", 24))
+        known = ctx.known_dates
 
-        def needs(i: dict) -> bool:
-            stored = ctx.known_dates.get(i["guid"])
-            return (i["guid"] not in ctx.known_dates
-                    or (stored is None and not i.get("published_at")))
-
-        need = [i for i in items if needs(i)][:limit]
+        # new items: not in the database yet
+        fresh = [i for i in items if i["guid"] not in known]
+        # stored items that still miss a date or a body. They are taken from
+        # the database, not from the listing, so an item that has scrolled off
+        # the page is still filled in. Items that are still on the listing are
+        # in here as well - they are worked on once, from here.
+        backlog = [b for b in ctx.backlog if _attempts(b) < MAX_ENRICH_ATTEMPTS]
+        size = len(backlog)
+        cursor = _read_cursor(ctx.config.get("backfill_cursor"))
+        if size:
+            cursor %= size
+            backlog = backlog[cursor:] + backlog[:cursor]
+        # both sides get a share: a listing full of new posts must not starve
+        # the backlog, and the backlog must not hold up the posts that just
+        # arrived
+        need_fresh = fresh[:max(1, limit // 2)]
+        need_backlog = backlog[:max(0, limit - len(need_fresh))]
+        need = need_fresh + need_backlog
         if not need:
-            return
-        sem = asyncio.Semaphore(6)
+            return [], None
 
-        async def one(item: dict) -> None:
+        sem = asyncio.Semaphore(6)
+        enriched: list[dict] = []
+        failed: list[dict] = []
+
+        async def one(item: dict, is_backlog: bool) -> None:
             async with sem:
                 try:
                     text = await ctx.get_text(item["url"])
@@ -575,9 +639,14 @@ class WebPlugin(Plugin):
                     article = await run_parse(extract_article, text, item["url"])
                 except Exception as exc:  # noqa: BLE001 - enrichment is best effort
                     ctx.logger.debug("enrich failed for %s: %s", item["url"], exc)
+                    _count_failure(item)
+                    if is_backlog:
+                        failed.append(item)
                     return
-                if article.get("content") and len(article["content"]) > len(item.get("summary", "")):
-                    item["content"] = article["content"]
+                gained = False
+                body = article.get("content") or ""
+                if body and len(body) > max(len(item.get("content") or ""), 120):
+                    item["content"] = body
                 if not item.get("summary") and article.get("summary"):
                     item["summary"] = article["summary"][:500]
                 if not item.get("published_at") and article.get("published_at"):
@@ -586,5 +655,27 @@ class WebPlugin(Plugin):
                     item["image_url"] = article["image_url"]
                 if not item.get("author") and article.get("author"):
                     item["author"] = article["author"]
+                # the item is finished when it has a date *and* a body - that
+                # is what the backlog looks for. A page that has neither
+                # (a listing that links to entries without an article behind
+                # them) would be fetched again for ever, so it is counted and
+                # given up on.
+                if not item.get("published_at") or not item.get("content"):
+                    _count_failure(item)
+                    if is_backlog:
+                        failed.append(item)
+                    return
+                _clear_failure(item)
+                if is_backlog:
+                    enriched.append(item)
 
-        await asyncio.gather(*(one(i) for i in need), return_exceptions=True)
+        await asyncio.gather(
+            *(one(i, False) for i in need_fresh),
+            *(one(b, True) for b in need_backlog),
+            return_exceptions=True,
+        )
+        if not size:
+            return enriched + failed, None
+        # the cursor moves past the items that were taken into the budget, so
+        # every stored item gets its turn even while some of them fail
+        return enriched + failed, (cursor + len(need_backlog)) % size

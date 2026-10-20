@@ -5,6 +5,7 @@ import time
 import pytest
 import pytest_asyncio
 
+from crawler.base import MAX_ENRICH_ATTEMPTS
 from models.database import SCHEMA_VERSION, Database, fts_query, normalize_url
 
 
@@ -707,6 +708,34 @@ async def test_backfill_items_is_oldest_first_and_skips_dismissed(db):
     await db.set_dismissed(items[0]["id"], True)
     backlog = await db.backfill_items(sid)
     assert items[0]["guid"] not in {b["guid"] for b in backlog}
+
+
+@pytest.mark.asyncio
+async def test_backfill_items_skips_items_given_up_on(db):
+    """An article page that cannot be fetched is tried a few times and then
+    left alone, so it cannot use up the budget for ever."""
+    sid = await db.create_source("https://example.com/rss", "Ex", "rss")
+    await db.upsert_items(sid, [_item("g1", published_at=None)])
+    await db.upsert_items(sid, [_item("g2", published_at=None)])
+    async with db.write() as conn:
+        await conn.execute(
+            "UPDATE items SET extra=? WHERE guid='g1'",
+            ('{"enrich_attempts": %d}' % MAX_ENRICH_ATTEMPTS,))
+    backlog = await db.backfill_items(sid)
+    assert [b["guid"] for b in backlog] == ["g2"]
+
+
+@pytest.mark.asyncio
+async def test_upsert_merges_extra_instead_of_replacing_it(db):
+    """Two copies of the same item must not lose each other's fields: the
+    listing copy has no attempt counter, the backfill copy has one."""
+    sid = await db.create_source("https://example.com/rss", "Ex", "rss")
+    await db.upsert_items(sid, [_item("g1", extra={"kind": "reddit", "score": 10})])
+    await db.upsert_items(sid, [_item("g1", extra={"enrich_attempts": 2})])
+    items, _ = await db.list_items(source_id=sid)
+    assert items[0]["extra"]["kind"] == "reddit"
+    assert items[0]["extra"]["score"] == 10
+    assert items[0]["extra"]["enrich_attempts"] == 2
 
 
 @pytest.mark.asyncio
