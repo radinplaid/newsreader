@@ -7,6 +7,7 @@ import logging
 import os
 import time
 from contextlib import asynccontextmanager
+from urllib.parse import urlparse
 
 import httpx
 
@@ -15,7 +16,6 @@ from crawler.base import FetchError
 from crawler.plugins.web import extract_article
 from crawler.pool import run_parse, shutdown_parse_pool
 from fastapi import FastAPI, HTTPException, Query, Request, Depends
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -41,6 +41,14 @@ async def lifespan(app: FastAPI):
     if settings.nr_refresh_interval_min > 0:
         app.state.auto_task = asyncio.create_task(_auto_refresh(app))
     log.info("newsreader ready: %s plugins registered", len(crawler.all_plugins()))
+    origins = allowed_origins()
+    if not origins:
+        log.info("API is same-origin only (set NR_ALLOWED_ORIGINS to allow others)")
+    elif "*" in origins:
+        log.warning("NR_ALLOWED_ORIGINS=* : any website may read and change "
+                    "this library through the browser")
+    else:
+        log.info("API accepts cross-origin requests from: %s", ", ".join(origins))
     yield
     if app.state.auto_task:
         app.state.auto_task.cancel()
@@ -62,9 +70,97 @@ async def _auto_refresh(app: FastAPI) -> None:
 
 
 app = FastAPI(title="Newsreader API", version="1.0", lifespan=lifespan)
-app.add_middleware(
-    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
-)
+
+
+# ----------------------------------------------------------------- origin policy
+_CORS_METHODS = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+_CORS_HEADERS = "Content-Type"
+
+#: methods that change something, and so need a browser check
+_WRITE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+
+def allowed_origins() -> list[str]:
+    """Origins allowed to call the API from a browser.
+
+    Empty (the default) means the server's own origin only: the API then
+    refuses writes that come from another site, so a page on any website
+    cannot delete sources or dismiss articles through the browser the user
+    is reading in.
+    """
+    raw = settings.nr_allowed_origins or ""
+    return [o.strip().rstrip("/") for o in raw.split(",") if o.strip()]
+
+
+def _is_own_origin(request: Request, origin: str) -> bool:
+    """True when the request came from this server's own web page.
+
+    The browser sends the Origin header on every write, and for a page
+    served by this server it names the host the request was addressed to.
+    The scheme is left out of the comparison on purpose: behind a reverse
+    proxy the server may not know it is being reached over https.
+    """
+    host = (request.headers.get("host") or "").lower()
+    if not host:
+        return False
+    return urlparse(origin).netloc.lower() == host
+
+
+def _origin_allowed(request: Request, origin: str, allowed: list[str],
+                    wildcard: bool) -> bool:
+    if wildcard:
+        return True
+    if origin.rstrip("/") in allowed:
+        return True
+    return _is_own_origin(request, origin)
+
+
+def _preflight(origin: str) -> Response:
+    return Response(
+        status_code=200,
+        headers={
+            "Access-Control-Allow-Origin": origin,
+            "Access-Control-Allow-Methods": _CORS_METHODS,
+            "Access-Control-Allow-Headers": _CORS_HEADERS,
+            "Access-Control-Max-Age": "600",
+            "Vary": "Origin",
+        },
+    )
+
+
+@app.middleware("http")
+async def cross_origin_policy(request: Request, call_next):
+    """Keep other websites out of the library.
+
+    Two things happen here:
+
+    * CORS headers are only handed to an origin that is allowed, so a page
+      on another site cannot read anything from this server.
+    * A write that carries an Origin header the server does not accept is
+      refused outright. Browsers send Origin on every POST/PUT/PATCH/DELETE
+      — including the ones they send without asking first — so this is what
+      stops another site from deleting sources through the user's browser.
+      Requests without an Origin header are not from a browser (curl, the
+      test suite, scripts) and are left alone.
+    """
+    origin = request.headers.get("origin")
+    allowed = allowed_origins()
+    wildcard = "*" in allowed
+    permitted = bool(origin) and _origin_allowed(request, origin, allowed, wildcard)
+    if permitted:
+        if request.method == "OPTIONS":
+            return _preflight("*" if wildcard else origin)
+        response = await call_next(request)
+        response.headers["Access-Control-Allow-Origin"] = "*" if wildcard else origin
+        response.headers["Vary"] = "Origin"
+        return response
+    if request.method == "OPTIONS" and origin:
+        # a preflight from an origin that is not allowed: say no, and the
+        # browser drops the request that would have followed it
+        return JSONResponse({"detail": "origin not allowed"}, status_code=403)
+    if origin and request.method in _WRITE_METHODS:
+        return JSONResponse({"detail": "origin not allowed"}, status_code=403)
+    return await call_next(request)
 
 
 # ----------------------------------------------------------------- models

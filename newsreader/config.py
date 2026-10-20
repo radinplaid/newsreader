@@ -15,6 +15,12 @@ class Settings(BaseSettings):
     nr_max_concurrency: int = 24
     nr_request_timeout: float = 30.0
     nr_db_readers: int = 4
+    #: origins allowed to call the API from a browser, comma separated.
+    #: Empty (the default) means same-origin only: the API then refuses
+    #: cross-origin writes, so a page on any website cannot touch the
+    #: library through the user's browser. Set it to the origin the static
+    #: client is served from when web/ is hosted somewhere else.
+    nr_allowed_origins: str = ""
     nr_parse_workers: int = Field(
         default_factory=lambda: max(1, min(4, os.cpu_count() or 1)))
 

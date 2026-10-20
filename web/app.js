@@ -44,8 +44,20 @@ const state = {
 };
 
 /* ---------------- helpers ---------------- */
+/* Every write carries a JSON content type. The server refuses the content
+   types a browser can send cross-origin without asking first, so this is
+   what makes a request from another website fail instead of silently
+   changing the library. */
 async function api(path, opts) {
-  const res = await fetch(`/api${path}`, opts);
+  const o = { ...(opts || {}) };
+  const method = (o.method || "GET").toUpperCase();
+  if (method === "POST" || method === "PUT" || method === "PATCH") {
+    const headers = o.headers || {};
+    const typed = Object.keys(headers).some((k) => k.toLowerCase() === "content-type");
+    if (!typed) o.headers = { ...headers, "Content-Type": "application/json" };
+    if (o.body === undefined) o.body = "{}";
+  }
+  const res = await fetch(`/api${path}`, o);
   if (!res.ok) {
     let msg = `${res.status}`;
     try { msg = (await res.json()).detail || msg; } catch (_e) { /* keep */ }

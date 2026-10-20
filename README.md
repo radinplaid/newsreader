@@ -235,8 +235,25 @@ GET    /api/events                     server-sent events: refresh start/progres
                                        completion + per-source failures (SSE)
 ```
 
-CORS is open, so the `web/` folder can be hosted anywhere (GitHub Pages, S3, …)
-and pointed at a running server — the client is purely static.
+## Who may talk to the API
+
+The API answers the browser that serves the web client, and nobody else.
+A page on any other website that the user visits cannot read from the
+server or change the library through it: browsers send the `Origin` header
+on every write, and the server refuses the ones it does not recognise.
+
+The `web/` folder can still be hosted anywhere (GitHub Pages, S3, …) and
+pointed at a running server — the client is purely static. Name the origin
+it is served from in `NR_ALLOWED_ORIGINS` and that origin is let in:
+
+```bash
+NR_ALLOWED_ORIGINS="https://reader.example.com" python -m api
+```
+
+Without it the server only answers its own origin. `NR_ALLOWED_ORIGINS=*`
+allows every origin and undoes the protection — the server says so when it
+starts. Requests that carry no `Origin` header are not from a browser
+(curl, scripts) and are always answered.
 
 ## Sharing sources
 
@@ -277,6 +294,7 @@ The API remains available through `GET /api/sources/export.opml` and
 | `NR_MAX_CONCURRENCY` | `24` | parallel source fetches per refresh |
 | `NR_REQUEST_TIMEOUT` | `30` | per-request timeout (s) |
 | `NR_DB_READERS` | `4` | pooled SQLite read connections (writes stay serialized) |
+| `NR_ALLOWED_ORIGINS` | (empty) | comma-separated origins allowed to call the API from a browser; empty = this server's own origin only (see [Who may talk to the API](#who-may-talk-to-the-api)) |
 | `NR_PARSE_WORKERS` | `min(4, cores)` | worker processes for HTML/XML parsing (`0` = parse in threads) |
 | `NR_REFRESH_INTERVAL_MIN` | `0` (off) | background auto-refresh interval |
 | `NR_MIN_REFRESH_MINUTES` | `15` | skip sources refreshed more recently than this (refresh-all / auto-refresh; `0` disables, per-source refresh with `"force": true` bypasses) |
@@ -328,4 +346,5 @@ python -m pytest            # offline unit tests (db, parsers, API)
 python -m pytest -m live    # live tests against the real sources
 node --test tests/source_transfer.test.cjs  # source transfer UI logic (requires Node.js)
 node --test tests/source_health.test.cjs    # sidebar source health rules (requires Node.js)
+node --test tests/api_client.test.cjs       # the client's request helper (requires Node.js)
 ```
