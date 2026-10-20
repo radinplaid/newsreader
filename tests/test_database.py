@@ -325,7 +325,7 @@ async def test_migrate_heals_stored_future_dates(db):
     with sqlite3.connect(db.path) as conn:
         conn.execute("PRAGMA user_version = 0")
         conn.execute("UPDATE items SET published_at=? WHERE guid='g2'", (future,))
-        Database._migrate(conn)
+        Database._heal(conn, 0)
         row = conn.execute(
             "SELECT published_at FROM items WHERE guid='g2'").fetchone()
         assert row[0] is None
@@ -627,7 +627,7 @@ async def test_migrate_backfills_read_at(db):
     with sqlite3.connect(db.path) as conn:
         cols = {r[1] for r in conn.execute("PRAGMA table_info(items)")}
         assert "read_at" not in cols
-        Database._migrate(conn)
+        Database._add_columns(conn)
         cols = {r[1] for r in conn.execute("PRAGMA table_info(items)")}
         assert "read_at" in cols
         n = conn.execute("SELECT COUNT(*) FROM items WHERE read_at IS NULL").fetchone()[0]
@@ -635,6 +635,50 @@ async def test_migrate_backfills_read_at(db):
     # new items, though, arrive unread
     await db.upsert_items(sid, [_item("g3", published_at=time.time())])
     assert (await db.list_items(unread=True))[1] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_database_without_the_new_columns_opens(tmp_path):
+    """A database from before first_seen_at and read_at existed must still
+    open: the columns are added before the indexes that refer to them."""
+    path = str(tmp_path / "ancient.db")
+    db = Database(path)
+    await db.init()
+    sid = await db.create_source("https://example.com/rss", "Ex", "rss")
+    await db.upsert_items(sid, [_item("g1", published_at=time.time())])
+    await db.close()
+
+    # roll the table back to the shape it had before those columns
+    with sqlite3.connect(path) as conn:
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND sql LIKE '%first_seen_at%'"
+            " OR sql LIKE '%read_at%'"
+        ).fetchall():
+            conn.execute(f"DROP INDEX IF EXISTS {row[0]}")
+        conn.execute("ALTER TABLE items DROP COLUMN read_at")
+        conn.execute("ALTER TABLE items DROP COLUMN first_seen_at")
+        conn.execute("PRAGMA user_version = 0")
+        conn.commit()
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(items)")}
+        assert "read_at" not in cols and "first_seen_at" not in cols
+
+    # the new code has to bring it along
+    db2 = Database(path)
+    await db2.init()
+    try:
+        conn = await db2.get_conn()
+        async with conn.execute("PRAGMA table_info(items)") as cur:
+            cols = {r["name"] for r in await cur.fetchall()}
+        assert "read_at" in cols and "first_seen_at" in cols
+        items, total = await db2.list_items(source_id=sid)
+        assert total == 1
+        # the old row is dated as "first seen" and counts as read, so upgrading
+        # does not present a backlog of unread articles
+        assert items[0]["published_at"] is not None
+        async with conn.execute("SELECT COUNT(*) FROM items WHERE read_at IS NULL") as cur:
+            assert (await cur.fetchone())[0] == 0
+    finally:
+        await db2.close()
 
 
 @pytest.mark.asyncio
@@ -736,6 +780,24 @@ async def test_upsert_merges_extra_instead_of_replacing_it(db):
     assert items[0]["extra"]["kind"] == "reddit"
     assert items[0]["extra"]["score"] == 10
     assert items[0]["extra"]["enrich_attempts"] == 2
+
+
+@pytest.mark.asyncio
+async def test_a_broken_json_column_does_not_break_the_library(db):
+    """A row written by an old version (or edited by hand) may hold
+    something that is not JSON; one broken row must not take everything
+    down with it."""
+    sid = await db.create_source("https://example.com/rss", "Ex", "rss")
+    await db.upsert_items(sid, [_item("g1")])
+    async with db.write() as conn:
+        await conn.execute("UPDATE items SET extra='not json at all' WHERE guid='g1'")
+    items, total = await db.list_items(source_id=sid)
+    assert total == 1
+    assert items[0]["extra"] == {}
+    # and the row can still be written to
+    await db.upsert_items(sid, [_item("g1", extra={"enrich_attempts": 1})])
+    items, _ = await db.list_items(source_id=sid)
+    assert items[0]["extra"]["enrich_attempts"] == 1
 
 
 @pytest.mark.asyncio

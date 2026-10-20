@@ -112,6 +112,16 @@ then run the same seed/serve commands with plain `python`.
 
 Open http://127.0.0.1:8000, press **Refresh all**, and read.
 
+**Upgrading an existing database.** Nothing to do: the server brings the
+database along on start-up. Columns that were added in later versions are
+added if they are missing, the indexes are created (or recreated where
+their shape changed), and the data is cleaned up once — the version of the
+schema is kept in the database itself, so the work is not repeated on
+every start. Articles, tags, read and starred state are left alone; rows
+written before unread tracking existed count as read, so an upgrade never
+presents a backlog of thousands of unread articles. Databases from the
+very first release open as well.
+
 To verify that every source parses correctly on its own:
 
 ```bash

@@ -146,10 +146,10 @@ END;
 
 _fts_token = re.compile(r'"[^"]*"|\w+')
 
-#: bumped whenever a one-time migration has to run for existing databases.
-#: Stored in SQLite's PRAGMA user_version, so a migration runs exactly once
-#: instead of on every boot.
-SCHEMA_VERSION = 1
+#: bumped whenever the schema changes in a way an existing database has to
+#: be brought along with. Stored in SQLite's PRAGMA user_version, so a
+#: migration runs exactly once instead of on every boot.
+SCHEMA_VERSION = 2
 
 #: rows sampled per index when collecting statistics for the query planner
 _ANALYSIS_LIMIT = 1000
@@ -184,6 +184,22 @@ def normalize_url(url: str) -> str:
     query = parts.query if len(kept) == len(pairs) else urlencode(kept)
     return urlunparse((parts.scheme.lower(), parts.netloc.lower(),
                        parts.path.rstrip("/"), parts.params, query, ""))
+
+
+def _load_json(text: str | None, default):
+    """Parse a JSON column, falling back to the default when it is broken.
+
+    A row written by an old version (or edited by hand) may hold something
+    that is not JSON at all; one broken row should not take the whole
+    library down.
+    """
+    if not text:
+        return default
+    try:
+        value = json.loads(text)
+    except (TypeError, ValueError):
+        return default
+    return value if isinstance(value, type(default)) else default
 
 
 def fts_query(q: str) -> str | None:
@@ -245,14 +261,22 @@ class Database:
         """Initialize the schema synchronously at startup if needed, then setup async."""
         conn = sqlite3.connect(self.path, timeout=30)
         conn.execute("PRAGMA journal_mode=WAL")
-        # Indexes whose definition changed are dropped first: CREATE INDEX IF
-        # NOT EXISTS keeps an existing index with the old shape, and the
-        # schema script below recreates them the way they are meant to be.
-        for stale in ("idx_items_read", "idx_items_dismissed_source",
-                      "idx_items_unread_count"):
-            conn.execute(f"DROP INDEX IF EXISTS {stale}")
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        if version < SCHEMA_VERSION:
+            # Indexes whose definition changed are dropped first: CREATE INDEX
+            # IF NOT EXISTS keeps an existing index with the old shape, and
+            # the schema script below recreates them the way they are meant
+            # to be. Only while the version is behind, so an index is not
+            # rebuilt on every start.
+            for stale in ("idx_items_read", "idx_items_dismissed_source",
+                          "idx_items_unread_count"):
+                conn.execute(f"DROP INDEX IF EXISTS {stale}")
+        # the columns come first: the indexes in the schema refer to them, so
+        # a database from before they were added has to be given them before
+        # the schema script runs
+        self._add_columns(conn)
         conn.executescript(_SCHEMA)
-        self._migrate(conn)
+        self._heal(conn, version)
         conn.execute(f"PRAGMA analysis_limit={_ANALYSIS_LIMIT}")
         conn.execute("ANALYZE")
         conn.commit()
@@ -276,8 +300,16 @@ class Database:
             await conn.execute("ANALYZE")
 
     @staticmethod
-    def _migrate(conn: sqlite3.Connection) -> None:
-        """Add columns introduced after the initial schema, heal bad data."""
+    def _add_columns(conn: sqlite3.Connection) -> None:
+        """Add the columns that were introduced after the initial schema.
+
+        This runs before the schema script, because the indexes in it are
+        built on some of these columns: a database from before a column
+        existed would otherwise fail to open.
+        """
+        if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                            "AND name='items'").fetchone():
+            return   # a fresh database: the schema script creates it complete
         cols = {r[1] for r in conn.execute("PRAGMA table_info(items)")}
         if "starred" not in cols:
             conn.execute("ALTER TABLE items ADD COLUMN starred INTEGER NOT NULL DEFAULT 0")
@@ -294,21 +326,20 @@ class Database:
             # so upgrading doesn't present a backlog of thousands of "unread"
             conn.execute("UPDATE items SET read_at = COALESCE(first_seen_at, fetched_at) "
                          "WHERE read_at IS NULL")
-        # after the column exists (initial schema or the ALTER above)
-        # (no index on read_at itself: idx_items_unread covers the only way
-        # read_at is ever filtered on, and a plain index there made the
-        # planner prefer it over the one that also carries the feed order)
         scols = {r[1] for r in conn.execute("PRAGMA table_info(sources)")}
         if "hidden" not in scols:
             conn.execute("ALTER TABLE sources ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0")
         if "error_streak" not in scols:
             conn.execute("ALTER TABLE sources ADD COLUMN error_streak INTEGER NOT NULL DEFAULT 0")
+
+    @staticmethod
+    def _heal(conn: sqlite3.Connection, version: int) -> None:
+        """Bring the data up to date. The heavy parts run only once."""
         # One-time cleanups only. Both of these walk the whole items table, so
         # running them on every boot made startup O(rows); they are needed
         # exactly once, to heal rows written by older versions. Fresh rows
         # cannot get into either state any more (upsert_items drops future
         # dates and stores normalised URLs), so the sweep is not repeated.
-        version = conn.execute("PRAGMA user_version").fetchone()[0]
         if version < 1:
             # items stored with a future date (feeds with broken CMS timezones):
             # never trustworthy, so drop them; first_seen takes over as fallback
@@ -421,7 +452,7 @@ class Database:
             out = []
             for r in rows:
                 d = dict(r)
-                d["config"] = json.loads(d["config"] or "{}")
+                d["config"] = _load_json(d["config"], {})
                 d["enabled"] = bool(d["enabled"])
                 d["hidden"] = bool(d["hidden"])
                 out.append(d)
@@ -443,7 +474,7 @@ class Database:
             if row is None:
                 return None
             d = dict(row)
-            d["config"] = json.loads(d["config"] or "{}")
+            d["config"] = _load_json(d["config"], {})
             d["enabled"] = bool(d["enabled"])
             d["hidden"] = bool(d["hidden"])
             return d
@@ -529,7 +560,7 @@ class Database:
         out = []
         for r in rows:
             d = dict(r)
-            d["extra"] = json.loads(d["extra"] or "{}")
+            d["extra"] = _load_json(d["extra"], {})
             d["tags"] = []
             out.append(d)
         return out
@@ -770,8 +801,8 @@ class Database:
         items = []
         for r in rows:
             d = dict(r)
-            d["tags"] = json.loads(d["tags"] or "[]")
-            d["extra"] = json.loads(d["extra"] or "{}")
+            d["tags"] = _load_json(d["tags"], [])
+            d["extra"] = _load_json(d["extra"], {})
             d["starred"] = bool(d["starred"])
             items.append(d)
         return items, total
@@ -783,8 +814,8 @@ class Database:
             if row is None:
                 return None
             d = dict(row)
-            d["tags"] = json.loads(d["tags"] or "[]")
-            d["extra"] = json.loads(d["extra"] or "{}")
+            d["tags"] = _load_json(d["tags"], [])
+            d["extra"] = _load_json(d["extra"], {})
             d["starred"] = bool(d["starred"])
             return d
 
