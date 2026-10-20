@@ -235,6 +235,11 @@ class Fetcher:
                         **{k: self.status[k] for k in
                            ("total", "done", "inserted", "errors")},
                     })
+                if self.status["inserted"]:
+                    # the table grew: refresh the planner's statistics so it
+                    # keeps using the sort index instead of sorting the whole
+                    # filtered set on every list request
+                    await self.db.analyze()
             return self.snapshot()
         finally:
             self._running = False

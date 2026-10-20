@@ -5,7 +5,7 @@ import time
 import pytest
 import pytest_asyncio
 
-from models.database import Database, fts_query, normalize_url
+from models.database import SCHEMA_VERSION, Database, fts_query, normalize_url
 
 
 @pytest_asyncio.fixture()
@@ -176,7 +176,10 @@ async def test_migrate_normalizes_stored_urls(tmp_path):
     db = Database(path)
     await db.init()
     sid = await db.create_source("https://example.com/rss", "Ex", "rss")
+    # pretend the row was written by an older version: that database has not
+    # run the one-time cleanup yet (user_version still 0)
     async with db.write() as conn:
+        await conn.execute("PRAGMA user_version = 0")
         await conn.execute(
             "INSERT INTO items (source_id, guid, url, fetched_at) VALUES (?, ?, ?, ?)",
             (sid, "g1", "https://Example.com/a/?utm_campaign=x", time.time()))
@@ -188,6 +191,43 @@ async def test_migrate_normalizes_stored_urls(tmp_path):
         assert lst[0]["url"] == "https://example.com/a"
     finally:
         await db2.close()
+
+
+@pytest.mark.asyncio
+async def test_migrate_cleanup_runs_only_once(tmp_path):
+    """The O(rows) cleanup is version-gated: it must not run on every boot."""
+    path = str(tmp_path / "mig.db")
+    db = Database(path)
+    await db.init()
+    sid = await db.create_source("https://example.com/rss", "Ex", "rss")
+    async with db.write() as conn:
+        await conn.execute("PRAGMA user_version = 0")
+        await conn.execute(
+            "INSERT INTO items (source_id, guid, url, fetched_at) VALUES (?, ?, ?, ?)",
+            (sid, "g1", "https://Example.com/a/?utm_campaign=x", time.time()))
+    await db.close()
+
+    # first boot after the upgrade: the cleanup runs
+    db2 = Database(path)
+    await db2.init()
+    async with db2.write() as conn:
+        async with conn.execute("PRAGMA user_version") as cur:
+            version = (await cur.fetchone())[0]
+        assert version == SCHEMA_VERSION
+    await db2.close()
+
+    # a later boot must leave the stored rows alone
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "UPDATE items SET url='https://example.com/mangled/?utm_x=1' WHERE guid='g1'")
+        conn.commit()
+    db3 = Database(path)
+    await db3.init()
+    try:
+        lst, _ = await db3.list_items(source_id=sid)
+        assert lst[0]["url"] == "https://example.com/mangled/?utm_x=1"
+    finally:
+        await db3.close()
 
 
 @pytest.mark.asyncio
@@ -279,8 +319,10 @@ async def test_migrate_heals_stored_future_dates(db):
     future = time.time() + 7200
     await db.upsert_items(sid, [_item("g1", published_at=past), _item("g2")])
     # plant a future date behind the back of upsert_items (pre-fix row), then
-    # re-run the migration; it is idempotent and must heal the bad row only
+    # re-run the migration on a database that has not been cleaned up yet;
+    # it is idempotent and must heal the bad row only
     with sqlite3.connect(db.path) as conn:
+        conn.execute("PRAGMA user_version = 0")
         conn.execute("UPDATE items SET published_at=? WHERE guid='g2'", (future,))
         Database._migrate(conn)
         row = conn.execute(
@@ -574,7 +616,11 @@ async def test_migrate_backfills_read_at(db):
     # simulate a pre-read_at database, then re-migrate: old rows must come
     # back marked read so upgrading never presents a huge "unread" backlog
     with sqlite3.connect(db.path) as conn:
-        conn.execute("DROP INDEX IF EXISTS idx_items_read")
+        # every index that mentions read_at has to go with the column
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND sql LIKE '%read_at%'"
+        ).fetchall():
+            conn.execute(f"DROP INDEX IF EXISTS {row[0]}")
         conn.execute("ALTER TABLE items DROP COLUMN read_at")
         conn.commit()
     with sqlite3.connect(db.path) as conn:
@@ -599,6 +645,68 @@ async def test_list_items_carries_extra_for_cards(db):
     full, _ = await db.list_items(source_id=sid, include_content=True)
     assert full[0]["extra"]["score"] == 250
     assert "content" in full[0]
+
+
+@pytest.mark.asyncio
+async def test_indexes_cover_the_hot_paths(db):
+    conn = await db.get_conn()
+    async with conn.execute("PRAGMA index_list(items)") as cur:
+        names = {r["name"] for r in await cur.fetchall()}
+    for idx in ("idx_items_url", "idx_items_sort", "idx_items_sort_source",
+                "idx_items_sort_asc", "idx_items_dismissed_source",
+                "idx_items_unread", "idx_items_starred", "idx_items_backfill"):
+        assert idx in names, f"missing index {idx}"
+
+
+@pytest.mark.asyncio
+async def test_backfill_items_lists_what_still_needs_enrichment(db):
+    sid = await db.create_source("https://example.com/rss", "Ex", "rss")
+    now = time.time()
+    # undated, no body -> needs a fetch
+    await db.upsert_items(sid, [_item("undated", published_at=None)])
+    # dated but no body -> still needs one
+    await db.upsert_items(sid, [_item("bodyless", published_at=now)])
+    # dated with a body -> complete
+    await db.upsert_items(sid, [_item("done", published_at=now, content="x" * 400)])
+    items, _ = await db.list_items(source_id=sid)
+    done = next(i for i in items if i["guid"] == "done")
+    # a complete item has a body and a date
+    assert done["published_at"]
+
+    backlog = await db.backfill_items(sid)
+    guids = {b["guid"] for b in backlog}
+    assert "undated" in guids
+    assert "bodyless" in guids
+    assert "done" not in guids
+    # every backlog row carries what is already stored, so merging what is
+    # fetched back into it cannot erase anything
+    row = next(b for b in backlog if b["guid"] == "undated")
+    assert row["title"]
+    assert row["tags"] == []
+    assert isinstance(row["extra"], dict)
+
+
+@pytest.mark.asyncio
+async def test_backfill_items_is_oldest_first_and_skips_dismissed(db):
+    sid = await db.create_source("https://example.com/rss", "Ex", "rss")
+    for i in range(3):
+        await db.upsert_items(sid, [_item(f"g{i}", published_at=None)])
+    # age them: g0 was seen first, g2 last
+    async with db.write() as conn:
+        await conn.execute(
+            "UPDATE items SET first_seen_at=? WHERE guid='g0'", (time.time() - 300,))
+        await conn.execute(
+            "UPDATE items SET first_seen_at=? WHERE guid='g1'", (time.time() - 200,))
+        await conn.execute(
+            "UPDATE items SET first_seen_at=? WHERE guid='g2'", (time.time() - 100,))
+    backlog = await db.backfill_items(sid)
+    assert [b["guid"] for b in backlog] == ["g0", "g1", "g2"]
+
+    # dismissed items are not worth fetching again
+    items, _ = await db.list_items(source_id=sid)
+    await db.set_dismissed(items[0]["id"], True)
+    backlog = await db.backfill_items(sid)
+    assert items[0]["guid"] not in {b["guid"] for b in backlog}
 
 
 @pytest.mark.asyncio
