@@ -9,7 +9,7 @@ place rather than duplicated.
 import httpx
 import pytest
 
-from crawler.base import FetchContext
+from crawler.base import ENRICH_ATTEMPTS_KEY, FetchContext
 from crawler.plugins.web import WebPlugin
 from models.database import Database
 
@@ -80,6 +80,48 @@ async def test_a_stored_item_is_finished_off_in_place(tmp_path):
 
         # and it is no longer unfinished, so it leaves the backlog
         assert await db.backfill_items(sid) == []
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_a_finished_item_forgets_its_failed_attempts(tmp_path):
+    """An item that failed twice and then succeeded must not keep the failure
+    count in the database: stored, it would leave one retry before the item
+    is given up on."""
+    db = Database(str(tmp_path / "attempts.db"))
+    await db.init()
+    try:
+        sid = await db.create_source("https://ex.com/blog", "Blog", "web")
+        _, _, ids = await db.upsert_items(sid, [{
+            "guid": "https://ex.com/blog/old-post",
+            "url": "https://ex.com/blog/old-post",
+            "title": "Old Post", "summary": "", "content": "",
+            "published_at": None, "image_url": "", "tags": [],
+            "extra": {ENRICH_ATTEMPTS_KEY: 2},
+        }])
+
+        def handler(request):
+            if request.url.path == "/blog":
+                return httpx.Response(200, text=LISTING)
+            return httpx.Response(200, text=ARTICLE)
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        backlog = await db.backfill_items(sid)
+        assert [b["guid"] for b in backlog] == ["https://ex.com/blog/old-post"]
+        ctx = FetchContext(
+            source={"id": sid, "url": "https://ex.com/blog", "name": "Blog"},
+            client=client, known_dates=await db.known_dates(sid),
+            config={"fetch_content": True, "content_fetch_limit": 4},
+            backlog=backlog,
+        )
+        result = await WebPlugin().fetch(ctx)
+        await client.aclose()
+        await db.upsert_items(sid, [item.to_row() for item in result.items])
+
+        row = await db.get_item(ids[0])
+        assert row["published_at"] is not None
+        assert ENRICH_ATTEMPTS_KEY not in row["extra"]
     finally:
         await db.close()
 

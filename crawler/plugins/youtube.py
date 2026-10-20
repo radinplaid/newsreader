@@ -205,6 +205,7 @@ class YouTubePlugin(Plugin):
 
         # in batches, so giving up after too many errors is decided between
         # batches instead of in the middle of one
+        attempted = 0
         for start in range(0, len(need), _DATE_CONCURRENCY):
             if errors >= max_errors:
                 logger.warning(
@@ -213,12 +214,14 @@ class YouTubePlugin(Plugin):
                     "refresh", errors)
                 break
             batch = need[start:start + _DATE_CONCURRENCY]
+            attempted += len(batch)
             await asyncio.gather(*(one(it) for it in batch), return_exceptions=True)
 
         if len(skip) > _SKIP_MAP_MAX:
             keep = sorted(skip, key=skip.get, reverse=True)[:_SKIP_MAP_MAX]
             skip = {g: skip[g] for g in keep}
-        # the cursor moves past the videos that were taken into the budget,
-        # so a run that gave up early still makes progress on the backlog
-        next_cursor = (cursor + len(need_backlog)) % size if size else cursor
+        # the cursor moves past the backlog videos that were actually tried;
+        # the ones a run gave up before keep their place for the next one
+        tried_backlog = max(0, attempted - len(need_fresh))
+        next_cursor = (cursor + tried_backlog) % size if size else cursor
         return _config_updates(skip, raw_skip, next_cursor, raw_cursor, size)

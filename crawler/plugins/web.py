@@ -81,7 +81,10 @@ def _count_failure(item: dict) -> None:
 def _clear_failure(item: dict) -> None:
     """The item was filled in after all: it gets another chance later."""
     extra = dict(item.get("extra") or {})
-    if extra.pop(ENRICH_ATTEMPTS_KEY, None) is not None:
+    if extra.get(ENRICH_ATTEMPTS_KEY) is not None:
+        # null, not a removal: the database merges extra with json_patch,
+        # which deletes a key when it is set to null
+        extra[ENRICH_ATTEMPTS_KEY] = None
         item["extra"] = extra
 
 

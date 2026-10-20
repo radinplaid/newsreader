@@ -730,6 +730,30 @@ async def test_youtube_date_fetch_rotates_the_backlog(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_youtube_bail_out_moves_the_cursor_only_past_attempted_videos(monkeypatch):
+    """The run gives up between batches of six. Videos it never reached must
+    keep their place in the rotation, not be skipped for a whole cycle."""
+    attempts = []
+
+    def fake_extract(url, opts):
+        if opts.get("extract_flat"):
+            return _yt_playlist([f"v{i}" for i in range(24)])
+        attempts.append(url.rsplit("=", 1)[1])
+        raise Exception("HTTP Error 500: Internal Server Error")
+
+    monkeypatch.setattr(yt_mod, "_extract", fake_extract)
+    known = {f"v{i}": None for i in range(24)}
+    ctx = _mock_ctx(lambda r: httpx.Response(200),
+                    url="https://www.youtube.com/@chan/videos",
+                    known_dates=known,
+                    config={"date_fetch_limit": 24, "date_fetch_max_errors": 1})
+    result = await yt_mod.YouTubePlugin().fetch(ctx)
+    await ctx.client.aclose()
+    assert len(attempts) == 6                # one batch, then it gave up
+    assert result.config_updates["date_fetch_cursor"] == 6
+
+
+@pytest.mark.asyncio
 async def test_youtube_date_fetch_bail_out_still_moves_the_cursor(monkeypatch):
     """Giving up after a few errors must not leave the rest of the backlog
     where it was, or the same videos would be retried for ever."""

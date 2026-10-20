@@ -75,8 +75,8 @@ CREATE INDEX IF NOT EXISTS idx_items_url ON items (url);
 
 -- the feed order sorts undated items last ("(published_at IS NULL)" first),
 -- which no plain index on published_at can serve: these expression indexes
--- match the ORDER BY exactly, so the planner walks them instead of sorting
--- the whole filtered set into a temporary b-tree
+-- match the ORDER BY exactly. The planner does not pick them by itself for
+-- the feed query, so list_items names them with INDEXED BY (see _forced_index)
 CREATE INDEX IF NOT EXISTS idx_items_sort ON items (
     (published_at IS NULL), published_at DESC, first_seen_at DESC, id DESC
 ) WHERE dismissed = 0;
@@ -755,6 +755,29 @@ class Database:
         clause = ("WHERE " + " AND ".join(where)) if where else ""
         return join, clause, args, match
 
+    @staticmethod
+    def _forced_index(sort: str, starred: bool, unread: bool, match, source_id,
+                      category_id, tag, ids) -> str | None:
+        """The index the plain feed, unread and starred views are read through.
+
+        The planner does not choose these on its own: with the sources join
+        and the tag subqueries it sorts the whole filtered set into a temp
+        b-tree (36 ms on 100k items, against 0.3 ms through the index). The
+        partial indexes match the views' WHERE clauses exactly, so naming one
+        is safe. Other views keep the planner's choice, which is faster for
+        them: a single source is 10x slower through the feed index.
+        The hint makes a missing index an error rather than a slow query, so
+        these indexes must keep being created in _SCHEMA.
+        """
+        if sort != "new" or match or source_id is not None or category_id is not None \
+                or tag or ids is not None:
+            return None
+        if starred:
+            return "idx_items_starred"
+        if unread:
+            return "idx_items_unread"
+        return "idx_items_sort"
+
     async def list_items(self, q: str | None = None, source_id: int | None = None,
                    category_id: int | None = None, tag: str | None = None,
                    starred: bool = False, unread: bool = False,
@@ -779,6 +802,11 @@ class Database:
         limit = max(1, min(int(limit), 200))
         offset = max(0, int(offset))
         select = self._SELECT if include_content else self._SELECT_LIST
+        index = self._forced_index(sort, starred, unread, match, source_id,
+                                   category_id, tag, ids)
+        if index:
+            # the first FROM of the select is the items table
+            select = select.replace("FROM items i", f"FROM items i INDEXED BY {index}", 1)
         conn = await self.get_conn()
         async with conn.execute(
             f"{select} {join} {clause} {order} LIMIT ? OFFSET ?",

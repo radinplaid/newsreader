@@ -6,7 +6,7 @@ import pytest
 import pytest_asyncio
 
 from crawler.base import MAX_ENRICH_ATTEMPTS
-from models.database import SCHEMA_VERSION, Database, fts_query, normalize_url
+from models.database import _SCHEMA, SCHEMA_VERSION, Database, fts_query, normalize_url
 
 
 @pytest_asyncio.fixture()
@@ -628,6 +628,7 @@ async def test_migrate_backfills_read_at(db):
         cols = {r[1] for r in conn.execute("PRAGMA table_info(items)")}
         assert "read_at" not in cols
         Database._add_columns(conn)
+        conn.executescript(_SCHEMA)   # as startup does: it recreates the indexes
         cols = {r[1] for r in conn.execute("PRAGMA table_info(items)")}
         assert "read_at" in cols
         n = conn.execute("SELECT COUNT(*) FROM items WHERE read_at IS NULL").fetchone()[0]
@@ -679,6 +680,244 @@ async def test_a_database_without_the_new_columns_opens(tmp_path):
             assert (await cur.fetchone())[0] == 0
     finally:
         await db2.close()
+
+
+#: the schema the first release created, before any column or index was added
+_FIRST_RELEASE_SCHEMA = """
+CREATE TABLE sources (
+    id                INTEGER PRIMARY KEY,
+    url               TEXT NOT NULL UNIQUE,
+    name              TEXT NOT NULL DEFAULT '',
+    plugin            TEXT NOT NULL DEFAULT '',
+    category_id       INTEGER,
+    enabled           INTEGER NOT NULL DEFAULT 1,
+    config            TEXT NOT NULL DEFAULT '{}',
+    etag              TEXT NOT NULL DEFAULT '',
+    last_modified     TEXT NOT NULL DEFAULT '',
+    last_refreshed_at REAL,
+    last_status       TEXT NOT NULL DEFAULT '',
+    last_error        TEXT NOT NULL DEFAULT '',
+    created_at        REAL NOT NULL
+);
+CREATE TABLE items (
+    id           INTEGER PRIMARY KEY,
+    source_id    INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    guid         TEXT NOT NULL,
+    url          TEXT NOT NULL DEFAULT '',
+    title        TEXT NOT NULL DEFAULT '',
+    summary      TEXT NOT NULL DEFAULT '',
+    content      TEXT NOT NULL DEFAULT '',
+    author       TEXT NOT NULL DEFAULT '',
+    published_at REAL,
+    image_url    TEXT NOT NULL DEFAULT '',
+    extra        TEXT NOT NULL DEFAULT '{}',
+    fetched_at   REAL NOT NULL,
+    starred      INTEGER NOT NULL DEFAULT 0,
+    dismissed    INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (source_id, guid)
+);
+CREATE INDEX idx_items_source_pub ON items (source_id, published_at DESC);
+CREATE INDEX idx_items_pub ON items (published_at DESC);
+CREATE TABLE tags (
+    id   INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE COLLATE NOCASE
+);
+CREATE TABLE item_tags (
+    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+    tag_id  INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+    PRIMARY KEY (item_id, tag_id)
+);
+CREATE INDEX idx_item_tags_tag ON item_tags (tag_id);
+CREATE VIRTUAL TABLE items_fts USING fts5(
+    title, summary, content,
+    content='items', content_rowid='id',
+    tokenize='porter unicode61'
+);
+CREATE TRIGGER items_fts_ai AFTER INSERT ON items BEGIN
+    INSERT INTO items_fts (rowid, title, summary, content)
+    VALUES (new.id, new.title, new.summary, new.content);
+END;
+CREATE TRIGGER items_fts_ad AFTER DELETE ON items BEGIN
+    INSERT INTO items_fts (items_fts, rowid, title, summary, content)
+    VALUES ('delete', old.id, old.title, old.summary, old.content);
+END;
+CREATE TRIGGER items_fts_au AFTER UPDATE OF title, summary, content ON items BEGIN
+    INSERT INTO items_fts (items_fts, rowid, title, summary, content)
+    VALUES ('delete', old.id, old.title, old.summary, old.content);
+    INSERT INTO items_fts (rowid, title, summary, content)
+    VALUES (new.id, new.title, new.summary, new.content);
+END;
+"""
+
+
+@pytest.mark.asyncio
+async def test_a_database_from_the_first_release_opens(tmp_path):
+    """The oldest shape: no read_at, first_seen_at, hidden or error_streak.
+    It has to open, keep its articles and their state, and come out of the
+    upgrade with the current columns."""
+    path = str(tmp_path / "first.db")
+    with sqlite3.connect(path) as conn:
+        conn.executescript(_FIRST_RELEASE_SCHEMA)
+        conn.execute("INSERT INTO sources (url, name, plugin, created_at) "
+                     "VALUES ('https://example.com/rss', 'Ex', 'rss', ?)", (time.time(),))
+        for guid, starred, dismissed in [("g1", 1, 0), ("g2", 0, 0), ("g3", 0, 1)]:
+            conn.execute(
+                "INSERT INTO items (source_id, guid, url, title, fetched_at, starred, dismissed) "
+                "VALUES (1, ?, ?, ?, ?, ?, ?)",
+                (guid, f"https://example.com/{guid}", guid.upper(), time.time(),
+                 starred, dismissed))
+        conn.commit()
+
+    for boot in range(2):   # the second boot must leave the same state behind
+        db = Database(path)
+        await db.init()
+        try:
+            conn = await db.get_conn()
+            async with conn.execute("PRAGMA table_info(items)") as cur:
+                item_cols = {r["name"] for r in await cur.fetchall()}
+            async with conn.execute("PRAGMA table_info(sources)") as cur:
+                source_cols = {r["name"] for r in await cur.fetchall()}
+            assert {"read_at", "first_seen_at"} <= item_cols
+            assert {"hidden", "error_streak"} <= source_cols
+
+            items, total = await db.list_items()
+            assert total == 2                       # the dismissed one stays hidden
+            assert {i["guid"] for i in items} == {"g1", "g2"}
+            starred, _ = await db.list_items(starred=True)
+            assert [i["guid"] for i in starred] == ["g1"]
+            # the articles were read before the upgrade, so they are not
+            # presented as a backlog of unread ones
+            assert (await db.list_items(unread=True))[1] == 0
+            counts = await db.counts()
+            assert counts["items"] == 2
+            assert counts["starred_items"] == 1
+            assert counts["unread_items"] == 0
+        finally:
+            await db.close()
+
+
+#: The feed order, as list_items spells it. The index that serves it has to
+#: match this exactly, or the planner sorts the whole filtered set again.
+_FEED_ORDER = ("ORDER BY (i.published_at IS NULL) ASC, i.published_at DESC, "
+               "i.first_seen_at DESC, i.id DESC")
+
+
+@pytest_asyncio.fixture()
+async def library(db):
+    """Twenty sources and 3000 items, with planner statistics collected."""
+    now = time.time()
+    for s in range(20):
+        sid = await db.create_source(f"https://e{s}.example/rss", f"E{s}", "rss")
+        await db.upsert_items(sid, [
+            _item(f"g{s}-{i}", url=f"https://e{s}.example/{i}", content="c" * 200,
+                  published_at=(now - i * 60) if i % 7 else None)
+            for i in range(150)])
+    await db.analyze()
+    return db
+
+
+async def _plan(db, sql, params=()):
+    conn = await db.get_conn()
+    async with conn.execute("EXPLAIN QUERY PLAN " + sql, list(params)) as cur:
+        return " | ".join(r[-1] for r in await cur.fetchall())
+
+
+@pytest.mark.asyncio
+async def test_feed_order_is_served_by_its_index(library):
+    plan = await _plan(library, f"SELECT i.id FROM items i WHERE i.dismissed = 0 "
+                                f"{_FEED_ORDER} LIMIT 50")
+    assert "idx_items_sort" in plan and "TEMP B-TREE" not in plan
+
+
+@pytest.mark.asyncio
+async def test_starred_view_is_served_by_its_index(library):
+    starred = await _plan(library, f"SELECT i.id FROM items i WHERE i.dismissed = 0 "
+                                   f"AND i.starred = 1 {_FEED_ORDER} LIMIT 50")
+    assert "idx_items_starred" in starred and "TEMP B-TREE" not in starred
+
+
+def test_forced_index_is_named_only_for_the_plain_views():
+    forced = Database._forced_index
+    assert forced("new", False, False, None, None, None, None, None) == "idx_items_sort"
+    assert forced("new", False, True, None, None, None, None, None) == "idx_items_unread"
+    assert forced("new", True, False, None, None, None, None, None) == "idx_items_starred"
+    # starred and unread together: the starred index also covers the query
+    assert forced("new", True, True, None, None, None, None, None) == "idx_items_starred"
+    # everything else keeps the planner's choice
+    assert forced("new", False, False, None, 3, None, None, None) is None      # one source
+    assert forced("new", False, False, None, None, 3, None, None) is None      # one category
+    assert forced("new", False, False, None, None, None, "news", None) is None # one tag
+    assert forced("new", False, False, None, None, None, None, [1, 2]) is None # explicit ids
+    assert forced("new", False, False, "term", None, None, None, None) is None # search
+    assert forced("old", False, False, None, None, None, None, None) is None   # oldest first
+
+
+@pytest.mark.asyncio
+async def test_forced_views_return_exactly_what_the_feed_order_says(library):
+    """list_items reads the plain views through a named index. The rows and
+    their order must still be the feed order over the visible items."""
+    async with library.write() as conn:
+        await conn.execute("UPDATE items SET read_at = first_seen_at WHERE id % 3 = 0")
+        await conn.execute("UPDATE items SET starred = 1 WHERE id % 5 = 0")
+        await conn.execute("UPDATE items SET dismissed = 1 WHERE id % 11 = 0")
+    conn = await library.get_conn()
+    async with conn.execute(
+        "SELECT i.id, i.published_at, i.first_seen_at, i.read_at, i.starred "
+        "FROM items i JOIN sources s ON s.id = i.source_id "
+        "WHERE i.dismissed = 0 AND s.hidden = 0") as cur:
+        rows = [dict(r) for r in await cur.fetchall()]
+
+    def expected(keep):
+        picked = [r for r in rows if keep(r)]
+        picked.sort(key=lambda r: (r["published_at"] is None,
+                                   -(r["published_at"] or 0), -r["first_seen_at"], -r["id"]))
+        return [r["id"] for r in picked]
+
+    views = {
+        "feed": ({}, expected(lambda r: True)),
+        "unread": ({"unread": True}, expected(lambda r: r["read_at"] is None)),
+        "starred": ({"starred": True}, expected(lambda r: r["starred"] == 1)),
+    }
+    for name, (kwargs, want) in views.items():
+        got = []
+        offset = 0
+        while True:   # page through the whole view, as the UI does
+            page, total = await library.list_items(limit=200, offset=offset, **kwargs)
+            got += [i["id"] for i in page]
+            offset += len(page)
+            if not page:
+                break
+        assert total == len(want), name
+        assert got == want, name
+
+
+@pytest.mark.asyncio
+async def test_counters_and_lookups_use_covering_indexes(library):
+    unread_count = await _plan(
+        library, "SELECT COUNT(*) FROM items i JOIN sources s ON s.id = i.source_id "
+                 "WHERE i.read_at IS NULL AND i.dismissed = 0 AND s.hidden = 0")
+    assert "COVERING INDEX idx_items_dismissed_source" in unread_count
+    url_lookup = await _plan(library, "SELECT DISTINCT url FROM items WHERE url IN (?, ?)",
+                             ["https://a", "https://b"])
+    assert "idx_items_url" in url_lookup
+    backlog = await _plan(
+        library, "SELECT guid FROM items WHERE source_id = ? AND dismissed = 0 "
+                 "AND (published_at IS NULL OR content = '') "
+                 "ORDER BY first_seen_at ASC, id ASC LIMIT 100", [1])
+    assert "idx_items_backfill" in backlog and "TEMP B-TREE" not in backlog
+
+
+@pytest.mark.asyncio
+async def test_forced_index_plan_has_no_sort_step(library):
+    """The statement list_items builds for the plain feed, with the index it
+    names, reads the index in order and does not sort."""
+    join, clause, args, _ = Database._filter_items()
+    sql = f"{Database._SELECT_LIST} {join} {clause} {_FEED_ORDER} LIMIT ? OFFSET ?"
+    sql = sql.replace("FROM items i", "FROM items i INDEXED BY idx_items_sort", 1)
+    plan = await _plan(library, sql, [*args, 50, 0])
+    # the feed is walked through the index; the only sort left is the one
+    # inside each row's tag subquery
+    assert plan.startswith("SCAN i USING INDEX idx_items_sort")
 
 
 @pytest.mark.asyncio
