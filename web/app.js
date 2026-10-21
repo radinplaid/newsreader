@@ -330,6 +330,11 @@ async function loadItems(reset = true) {
     $("#itemList").append(el("div", { class: "loading", id: "moreLoading" },
       el("div", { class: "spinner" })));
   }
+  // the unread view shrinks as articles are read, so the server's offset is the
+  // count of still-unread articles already loaded, not every article loaded
+  if (state.unread && !reset) {
+    state.offset = state.items.filter((i) => !i.read_at).length;
+  }
   const params = new URLSearchParams({
     sort: state.sort, limit: "50", offset: String(state.offset),
   });
