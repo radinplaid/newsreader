@@ -1300,8 +1300,10 @@ iframe.yt-frame {
 .sm-transfer[open] > summary { margin-bottom: 4px; }
 .sm-transfer .source-transfer:first-of-type { border-top: none; }
 @media (max-width: 760px) {
-  .sm-row { grid-template-columns: minmax(0, 1fr) auto; }
+  .sm-row { grid-template-columns: minmax(0, 1fr); gap: 6px; }
+  .sm-name { white-space: normal; overflow-wrap: anywhere; }
   .sm-cat, .sm-plugin, .sm-count, .sm-status { display: none; }
+  .sm-actions { justify-content: space-between; }
 }
 .source-transfer .btn { min-height: 44px; }
 .import-confirmation { margin-top: 14px; padding: 14px; background: var(--surface-hover); border-radius: var(--radius); }
@@ -1553,6 +1555,8 @@ iframe.yt-frame {
   .side-list li { min-height: 40px; }
   .side-list .src-actions { display: inline-flex; }
   .side-list .src-actions .mini-btn { width: 30px; height: 30px; }
+  .sm-actions .mini-btn { width: 40px; height: 40px; border-radius: 10px; }
+  .sm-actions .mini-btn .icon { width: 17px; height: 17px; }
   #srcList .count { display: none; }
   .side-list li:hover .src-actions ~ .count { display: none; }
   .tag-cloud .chip { padding: 6px 11px; }
