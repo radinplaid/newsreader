@@ -1561,6 +1561,7 @@ iframe.yt-frame {
     margin-left: 0;
   }
   .side-list .count { order: 0; }
+  .side-list .src-actions.cat-only { flex-basis: auto; order: 0; }
   .side-list .src-actions .mini-btn { width: 40px; height: 36px; border-radius: 10px; }
   .side-list .src-actions .mini-btn .icon { width: 16px; height: 16px; }
   .sm-actions .mini-btn { width: 40px; height: 40px; border-radius: 10px; }

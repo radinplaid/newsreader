@@ -482,33 +482,14 @@ function renderCategories() {
   const list = $("#catList");
   list.replaceChildren();
   for (const cat of state.categories) {
-    const actions = el("span", { class: "src-actions" },
+    const actions = el("span", { class: "src-actions cat-only" },
       el("span", {
-        class: "mini-btn", title: "Rename category", "aria-label": "Rename category",
-        onclick: async (ev) => {
+        class: "mini-btn", title: "Edit category", "aria-label": "Edit category",
+        onclick: (ev) => {
           ev.stopPropagation();
-          const name = prompt("Rename category:", cat.name);
-          if (!name || name.trim() === cat.name) return;
-          try {
-            await api(`/categories/${cat.id}`, { method: "PATCH",
-              body: JSON.stringify({ name: name.trim() }),
-              headers: { "Content-Type": "application/json" } });
-            loadSidebar();
-          } catch (err) { toast(err.message, true); }
+          openCategoryDialog(cat);
         },
-      }, icon("pencil")),
-      el("span", {
-        class: "mini-btn danger", title: "Delete category", "aria-label": "Delete category",
-        onclick: async (ev) => {
-          ev.stopPropagation();
-          if (!confirm(`Delete category “${cat.name}”? Sources become uncategorized.`)) return;
-          try {
-            await api(`/categories/${cat.id}`, { method: "DELETE" });
-            if (state.categoryId === cat.id) setView({ categoryId: null });
-            loadSidebar();
-          } catch (err) { toast(err.message, true); }
-        },
-      }, icon("x")));
+      }, icon("pencil")));
     const expandable = state.sources.some((s) => s.category_id === cat.id);
     const open = isGroupExpanded(cat.id);
     const li = el("li", {
@@ -2338,6 +2319,43 @@ $("#editDelete").addEventListener("click", async () => {
     toast("Source deleted");
     if (state.sourceId === editingSource.id) setView({ sourceId: null });
     refreshSidebar();
+  } catch (err) { toast(err.message, true); }
+});
+
+let editingCategory = null;
+
+function openCategoryDialog(cat) {
+  editingCategory = cat;
+  $("#catForm").elements.name.value = cat.name;
+  $("#catDialog").showModal();
+}
+
+$("#catCancel").addEventListener("click", () => $("#catDialog").close());
+
+$("#catDelete").addEventListener("click", async () => {
+  if (!editingCategory) return;
+  const cat = editingCategory;
+  if (!confirm(`Delete category “${cat.name}”? Sources become uncategorized.`)) return;
+  try {
+    await api(`/categories/${cat.id}`, { method: "DELETE" });
+    $("#catDialog").close();
+    if (state.categoryId === cat.id) setView({ categoryId: null });
+    loadSidebar();
+  } catch (err) { toast(err.message, true); }
+});
+
+$("#catForm").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  if (!editingCategory) return;
+  const cat = editingCategory;
+  const name = ev.target.elements.name.value.trim();
+  if (!name || name === cat.name) { $("#catDialog").close(); return; }
+  try {
+    await api(`/categories/${cat.id}`, { method: "PATCH",
+      body: JSON.stringify({ name }),
+      headers: { "Content-Type": "application/json" } });
+    $("#catDialog").close();
+    loadSidebar();
   } catch (err) { toast(err.message, true); }
 });
 

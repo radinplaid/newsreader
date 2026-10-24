@@ -304,6 +304,23 @@
   </form>
 </dialog>
 
+<!-- edit category dialog -->
+<dialog id="catDialog" class="modal">
+  <form id="catForm" novalidate>
+    <h3>Edit category</h3>
+    <label>Name
+      <input name="name" type="text" required autocomplete="off">
+    </label>
+    <div class="modal-actions space-between">
+      <button type="button" class="btn danger" id="catDelete">Delete category…</button>
+      <span class="modal-actions">
+        <button type="button" class="btn ghost" id="catCancel">Cancel</button>
+        <button type="submit" class="btn primary">Save</button>
+      </span>
+    </div>
+  </form>
+</dialog>
+
 <!-- source transfer dialog -->
 <dialog id="sourcesDialog" class="modal sources-modal" aria-labelledby="sourcesTitle">
   <div class="sm-head">
