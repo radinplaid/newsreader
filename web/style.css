@@ -1552,9 +1552,17 @@ iframe.yt-frame {
   }
   .row-actions .mini-btn { width: 40px; height: 40px; border-radius: 10px; }
   .row-actions .mini-btn .icon { width: 17px; height: 17px; }
-  .side-list li { min-height: 40px; }
-  .side-list .src-actions { display: inline-flex; }
-  .side-list .src-actions .mini-btn { width: 30px; height: 30px; }
+  .side-list li { min-height: 40px; flex-wrap: wrap; row-gap: 4px; }
+  .side-list .src-actions {
+    display: inline-flex;
+    order: 1;
+    flex-basis: 100%;
+    justify-content: flex-end;
+    margin-left: 0;
+  }
+  .side-list .count { order: 0; }
+  .side-list .src-actions .mini-btn { width: 40px; height: 36px; border-radius: 10px; }
+  .side-list .src-actions .mini-btn .icon { width: 16px; height: 16px; }
   .sm-actions .mini-btn { width: 40px; height: 40px; border-radius: 10px; }
   .sm-actions .mini-btn .icon { width: 17px; height: 17px; }
   #srcList .count { display: none; }
